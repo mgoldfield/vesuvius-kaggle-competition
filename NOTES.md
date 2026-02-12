@@ -187,27 +187,37 @@ Add `nn.Dropout3d(p=0.2)` after the bottleneck block in UNet3D.forward(), before
 - [ ] **Gaussian-weighted SWI blending** — replace simple overlap averaging with Gaussian
   importance weighting (center of each patch weighted higher). All top notebooks use this.
   No retraining needed, just change inference. (from notebook analysis)
+  **Status:** Implemented in `scripts/eval_inference.py` but eval never ran overnight.
+  Need to run eval to measure impact before adopting in Kaggle inference.
 - [ ] **Logit-space TTA averaging** — average raw model outputs before sigmoid, not after.
   More principled (equivalent to geometric mean in probability space). Free improvement.
   (from notebook analysis)
+  **Status:** Implemented in `scripts/eval_inference.py` but eval never ran overnight.
+  Need to run eval to measure impact before adopting in Kaggle inference.
 - [x] **Killer ant surface splitting** — raycasting + Dijkstra3D recursive splitting of
   merged papyrus sheets in post-processing. Model-agnostic, directly targets TopoScore + VOI.
   Uses `cc3d` + `dijkstra3d`. Integrated into both eval script and Kaggle inference.
   Wheels bundled in `kaggle/kaggle_weights/wheels/` for offline Kaggle install.
+  **Status:** Code integrated but never evaluated on val set. `eval_inference.py --split`
+  will measure impact. Kaggle wheels upload also failed (missing `--dir-mode zip`).
 
 ### Medium impact, moderate effort
-- [x] **Attention gates on skip connections** — added in Run 10. AttentionGate3D at each
-  skip connection, ~5.5K params (~0.1%). Learns to suppress irrelevant background features.
+- [ ] **Attention gates on skip connections** — added in Run 10 but **unverified** due to LR
+  issue (new modules couldn't learn). Re-testing in Run 10b with per-module lr_find.
+  AttentionGate3D at each skip connection, ~5.5K params (~0.1%).
 - [ ] **nnUNet framework** — self-configuring medical segmentation framework that often
   wins competitions. Someone has already preprocessed our data for nnUNetv2 (91.8 GB
   dataset on Kaggle). Would require learning the framework but could yield strong results
   with minimal manual tuning.
-- [x] **Scroll-level cross-validation** — added in Run 11. 3-fold scroll-grouped CV with
-  probability averaging ensemble.
+- [ ] **Scroll-level cross-validation** — added in Run 11 but **unverified** — v11 used the
+  same SegResNetDSAttn + LR as v10, so results are unreliable. Need to re-run after v10b
+  proves out correct LRs. 3-fold scroll-grouped CV with probability averaging ensemble.
 - [ ] **Post-processing** — connected component filtering, morphological operations to clean
   up surfaces. Important for TopoScore (rewards continuous surfaces, penalizes holes/mergers).
-- [x] **Deep supervision** — added in Run 10. Auxiliary 1x1 conv heads at decoder levels 0
-  (64ch @ D/4) and 1 (32ch @ D/2). Upsampled to full res, supervised with BCE+Dice (weight=0.3).
+- [ ] **Deep supervision** — added in Run 10 but **unverified** due to LR issue (DS heads
+  couldn't learn). Re-testing in Run 10b with per-module lr_find. Auxiliary 1x1 conv heads
+  at decoder levels 0 (64ch @ D/4) and 1 (32ch @ D/2). Upsampled to full res, supervised
+  with BCE+Dice (weight=0.3).
 - [ ] **Volume caching in RAM** — 786 volumes x 32MB = ~25 GB, fits in 125 GB RAM. Would
   eliminate I/O bottleneck if we're data-loading bound.
 - [ ] **Skeleton recall loss** — add skeleton-based recall term to loss. Pre-compute GT
@@ -245,8 +255,10 @@ Add `nn.Dropout3d(p=0.2)` after the bottleneck block in UNet3D.forward(), before
 | Run 2 | Feb 10 | 0.172 | — | 0.290 | GroupNorm + Dropout — worse score despite better dice! |
 | Run 3 | Feb 10 | 0.281 | — | 0.348 | SegResNet + clDice |
 | Run 8 | Feb 11 | 0.276 | 0.562 | 0.423 | FG-biased sampling + TTA + hysteresis (LR too high — peaked epoch 1) |
-| Run 9 | — | 0.278 | 0.570 | TBD | Lower LR (1e-5), T_low=0.40 — steady improvement to epoch 8 |
-| Run 10 | — | — | — | — | + Deep supervision + attention gates — queued |
+| Run 9 | Feb 12 (v13) | 0.278 | 0.570 | TBD | Lower LR (1e-5), T_low=0.40 — Kaggle v13 with surface splitting fix |
+| Run 10 | — | 0.154 | 0.584 | — | + DS + attn gates — peaked epoch 0, never learned (LR issue) |
+| Run 10b-v1 | — | 0.283 | 0.567 | — | Per-module lr_find valley — still too aggressive, peaked epoch 1 |
+| Run 10b-v2 | — | TBD | TBD | TBD | Hardcoded LRs (eyeballed from lr_find plots) — in progress |
 
 **Key insight:** Higher validation dice does NOT equal better competition score. The metric
 (TopoScore + SurfaceDice + VOI) cares about topology and surface quality, not just voxel
@@ -361,7 +373,7 @@ overlap. This is why targeting the loss function and post-processing matters mor
   - Verification comp_score (3 volumes): 0.573, 0.546, 0.601 → mean **0.573**
 - **Notebook:** `notebooks/vesuvius_train_v9.ipynb`
 
-### Run 10: Deep Supervision + Attention Gates (queued)
+### Run 10: Deep Supervision + Attention Gates (complete)
 - **Architecture:** `SegResNetDSAttn` — subclasses SegResNet with two additions:
   - **Attention gates** on all 3 skip connections (Oktay et al., 2018)
     - Learns spatial attention weights to suppress irrelevant background features
@@ -383,9 +395,50 @@ overlap. This is why targeting the loss function and post-processing matters mor
 - **Loss:** Main output: 0.2*BCE + 0.2*Dice + 0.3*clDice + 0.3*Boundary
   Auxiliary outputs: 0.5*BCE + 0.5*Dice, weight=0.3
 - Everything else same as Run 9
+- **Results:** Best comp_score **0.584** at epoch 0 — model peaked immediately, never improved
+  - Dice dropped to **0.154** (vs Run 9's 0.278)
+  - Predicted 0% foreground on test volume
+  - T_low=0.35 won threshold sweep (dice=0.154)
+  - Verification comp_score (3 volumes): 0.575, 0.475, 0.527 → mean **0.526**
+  - **Issue:** New attention gates + DS heads are randomly initialized but shared the same
+    low LR (1e-5) as the pretrained modules. They needed much higher LR to learn.
+    The pretrained modules dominated, and the new modules couldn't catch up.
 - **Notebook:** `notebooks/vesuvius_train_v10.ipynb`
 
-### Run 11: 3-Fold Cross-Validation Ensemble (queued)
+### Run 10b-v1: Per-Module lr_find Valley (complete — LR still too high)
+- **Architecture:** Same SegResNetDSAttn as Run 10
+- **Key change:** 4 parameter groups with independent lr_find for each:
+  - Group 0 (encoder): convInit + down_layers [pretrained] — lr_find range [1e-9, 1e-3]
+  - Group 1 (decoder): up_layers + up_samples [pretrained] — lr_find range [1e-8, 1e-2]
+  - Group 2 (new_modules): attention_gates + ds_heads [random init] — lr_find range [1e-7, 1e-1]
+  - Group 3 (head): conv_final [random init] — lr_find range [1e-7, 1e-1]
+- **Selective freeze:** For each lr_find run, freeze all groups except the target group.
+  Extract valley LR from each. Reset model weights between runs.
+- **Valley LRs:** encoder=9.12e-6, decoder=9.12e-5, new_modules=2.40e-3, head=5.50e-3
+- **Results:** Best comp_score **0.567** at epoch 1 — peaked early again (same pattern as Run 8)
+  - T_low=0.40 won threshold sweep (dice=0.283)
+  - Verification comp_score: 0.576, 0.548, 0.589 → mean **0.571**
+  - Test volume predicted **0% foreground** — same failure as v10
+  - **Issue:** `lr_find().valley` consistently picks ~100x too aggressively for this model.
+    The valley heuristic finds the steepest descent point, but the actual usable LR is
+    at the first dip before the steep descent region.
+- **Notebook:** `notebooks/vesuvius_train_v10b.ipynb`
+
+### Run 10b-v2: Hardcoded LRs from lr_find Plots (in progress)
+- **Architecture:** Same SegResNetDSAttn as Run 10
+- **Key change:** Hardcoded LRs eyeballed from the first valley in lr_find plots (~100x
+  lower than valley method, consistent 10x spacing between groups):
+  - Group 0 (encoder): **1e-7** (valley was 9.12e-6)
+  - Group 1 (decoder): **1e-6** (valley was 9.12e-5)
+  - Group 2 (new_modules): **1e-5** (valley was 2.40e-3)
+  - Group 3 (head): **1e-4** (valley was 5.50e-3)
+- **Motivation:** lr_find valley heuristic is unreliable for this model — consistently
+  picks too high, causing model to peak at epoch 0-1. Same issue seen in Run 8→9 where
+  manually lowering LR 50x fixed early peaking.
+- Everything else same as v10b-v1
+- **Notebook:** `notebooks/vesuvius_train_v10b.ipynb` (Cell 18 updated with hardcoded LRs)
+
+### Run 11: 3-Fold Cross-Validation Ensemble (complete — but LR issue, results unreliable)
 - **Architecture:** Same SegResNetDSAttn as Run 10 (attention gates + deep supervision)
 - **Key change:** 3-fold scroll-grouped cross-validation with probability averaging ensemble
   - Fold 0: hold out scrolls 35360 + 53997 (189 val, 597 train) — largest training set first
@@ -397,15 +450,44 @@ overlap. This is why targeting the loss function and post-processing matters mor
 - **Kaggle time estimate:** 120 volumes × 21 passes × 27 patches × ~0.03s ≈ 34 min (well within 9hr)
 - **Weights:** ~54 MB total (3 × 18 MB traced models)
 - Everything else same as Run 10
+- **Results:** Completed overnight (3 folds trained, all traced). However, v11 uses the same
+  SegResNetDSAttn architecture and same LR=1e-5 as v10, so it suffers from the **same LR issue**
+  — the attention gates and DS heads couldn't learn. Results are unreliable and the technique
+  (CV + ensembling) is unverified. Needs to be re-run after v10b's per-module lr_find proves
+  out the correct LRs.
 - **Notebook:** `notebooks/vesuvius_train_v11.ipynb`
 
 ## Overnight Pipeline (Feb 12, 2026)
 
-The overnight automation script (`scripts/overnight_pipeline.sh`) runs:
-1. Wait for v10 training to complete (nbconvert PID 8527)
-2. Trace v10 model → upload weights → push Kaggle inference notebook
-3. Run v11 training (3-fold CV via nbconvert)
-4. Trace v11 ensemble models (ready for manual submission)
+The overnight automation script (`scripts/overnight_pipeline.sh`) ran:
+1. Wait for v10 training to complete (nbconvert PID 8527) — done ~02:12
+2. Trace v10 model → upload weights → push Kaggle inference notebook (version 9) — done ~02:32
+3. Run v11 training (3-fold CV via nbconvert) — done ~03:31
+4. Trace v11 ensemble models — done ~03:31
+
+## Kaggle Notebook Version History
+| Kaggle Version | Weights | Date | Status | Notes |
+|----------------|---------|------|--------|-------|
+| v9 | v10 traced | Feb 12 ~02:32 | ERROR | Overnight pipeline — v10 weights (bad, peaked epoch 0) |
+| v10-v11 | — | — | — | Unknown / intermediate |
+| v12 | v9 traced | Feb 12 | ERROR | Fixed wheels (cp312) but `cc3d.__version__` crash |
+| v13 | v9 traced | Feb 12 | SUBMITTED | Fixed cc3d version print — first real v9 submission |
+
+Weights dataset uploaded Feb 12 with `--dir-mode zip`: v9 traced + v10 traced + v11 fold
+traces + wheels (cp310/311/312 for cc3d + dijkstra3d). Inference script points at
+`best_segresnet_v9_traced.pt`, uses Gaussian SWI + logit TTA + hysteresis + surface splitting.
+
+**Issues discovered (overnight pipeline):**
+- **V10 submission used bad weights** — v10 peaked at epoch 0 due to LR issue. The overnight
+  pipeline submitted v10 weights to Kaggle (version 9) which are worse than v9.
+- **Eval inference never ran** — the `eval_inference.py` script (Gaussian SWI + logit TTA +
+  surface splitting comparison) was not in the version of the pipeline that ran overnight.
+  The script was added to the pipeline after the overnight run started. Need to run manually.
+- **Wheels not uploaded** — `kaggle datasets version` was called without `--dir-mode zip`,
+  so the `wheels/` folder (cc3d + dijkstra3d) was skipped. Surface splitting in Kaggle
+  inference would fail.
+- **V11 results unreliable** — v11 used the same SegResNetDSAttn + LR as v10, so all 3 folds
+  suffer from the same LR issue. CV + ensembling technique is unverified.
 
 ### Morning Checklist
 1. **Check v10 submission status:**
@@ -567,6 +649,18 @@ kaggle kernels status mgoldfield/vesuvius-surface-detection-inference
 - **MONAI not installed on Kaggle** — use `torch.jit.trace` to export models
   that depend on MONAI. The traced `.pt` file loads with just `torch.jit.load`
   and has no external dependencies.
+- **Dataset uploads are slow to start** — `kaggle datasets version` uploads via
+  GCS resumable upload. Each file sits at 0% for ~8-9 minutes before progress
+  begins. This is normal — don't kill the process. With 5 × 18MB files it takes
+  ~45-50 minutes total. Run uploads in the background.
+- **Stale upload resume tokens** — Kaggle CLI 2.0 caches resumable upload info
+  in `/tmp/.kaggle/uploads/*.json`. If a previous upload was interrupted, the
+  stale files cause `KaggleObject.from_dict() got an unexpected keyword argument
+  'token'` and the upload hangs at 0% indefinitely. **Fix:** delete the stale
+  JSON files: `rm /tmp/.kaggle/uploads/*.json` and retry.
+- **Folders skipped without `--dir-mode zip`** — `kaggle datasets version` skips
+  subdirectories by default. To include folders (e.g. `wheels/`), you must pass
+  `--dir-mode zip`. Without it you'll see "Skipping folder: wheels" in the output.
 
 ### Current submission artifacts
 - Weights dataset: https://www.kaggle.com/datasets/mgoldfield/vesuvius-unet3d-weights
@@ -634,6 +728,12 @@ Allowed by competition rules. Options:
 - **Stale Jupyter kernels eating GPU:** Multiple old kernels can accumulate on the GPU
   without being visible. Check with `nvidia-smi` — kill stale python processes if GPU is
   full. Use Jupyter Lab's "Running Kernels" panel to shut down old kernels.
+- **Kaggle upload hangs (stale resume tokens):** Kaggle CLI 2.0 caches upload state in
+  `/tmp/.kaggle/uploads/*.json`. After interrupted uploads, stale files cause
+  `from_dict() got an unexpected keyword argument 'token'` and the upload hangs forever
+  at 0%. Fix: `rm /tmp/.kaggle/uploads/*.json` and retry. Even without stale files,
+  uploads sit at 0% for ~8-9 minutes per file before progress starts (GCS resumable
+  upload initiation delay). Don't kill the process — it will eventually start.
 
 ## File Structure
 ```
@@ -649,6 +749,7 @@ Allowed by competition rules. Options:
 │   ├── vesuvius_train_v8.ipynb #   Run 8 (+ foreground-biased sampling)
 │   ├── vesuvius_train_v9.ipynb #   Run 9 (+ lower LR hardcoded)
 │   ├── vesuvius_train_v10.ipynb #  Run 10 (+ deep supervision + attention gates)
+│   ├── vesuvius_train_v10b.ipynb # Run 10b (per-module lr_find)
 │   └── vesuvius_train_v11.ipynb #  Run 11 (3-fold CV ensemble)
 ├── data/                       # Competition data (not in git)
 │   ├── train_images/           #   786 .tif volumes (320^3 uint8)

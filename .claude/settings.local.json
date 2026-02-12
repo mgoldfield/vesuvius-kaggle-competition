@@ -64,7 +64,14 @@
       "Bash(kaggle datasets download:*)",
       "Bash(kaggle kernels output:*)",
       "WebFetch(domain:raw.githubusercontent.com)",
-      "Bash(pip download:*)"
+      "Bash(pip download:*)",
+      "Bash(gh api:*)",
+      "Bash(vesuvius/bin/kaggle:*)",
+      "Bash(vesuvius/bin/pip show:*)",
+      "Bash(vesuvius/bin/pip index versions:*)",
+      "Bash(vesuvius/bin/python:*)",
+      "Bash(kaggle kernels push:*)",
+      "Bash(xargs:*)"
     ]
   }
 }

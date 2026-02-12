@@ -19,27 +19,43 @@ from scipy.ndimage import (
 )
 
 # ── Install surface splitting dependencies from bundled wheels ──
-_WHEELS_DIR = Path("/kaggle/input/vesuvius-unet3d-weights/wheels")
-HAS_SURFACE_SPLITTER = False
-if _WHEELS_DIR.exists():
-    try:
-        import cc3d
-        import dijkstra3d
-        HAS_SURFACE_SPLITTER = True
-        print("cc3d and dijkstra3d already available")
-    except ImportError:
-        print("Installing cc3d and dijkstra3d from bundled wheels...")
-        subprocess.check_call([
-            sys.executable, "-m", "pip", "install",
-            "--no-index", "--find-links", str(_WHEELS_DIR),
-            "connected-components-3d", "dijkstra3d",
-        ])
-        import cc3d
-        import dijkstra3d
-        HAS_SURFACE_SPLITTER = True
-        print(f"Installed cc3d {cc3d.__version__}, dijkstra3d")
-else:
-    print("No wheels directory found, surface splitting disabled")
+# Wheels may be at wheels/ (direct upload) or wheels/wheels/ (--dir-mode zip nesting)
+_WEIGHTS_BASE = Path("/kaggle/input/vesuvius-unet3d-weights")
+_WHEELS_CANDIDATES = [
+    _WEIGHTS_BASE / "wheels",
+    _WEIGHTS_BASE / "wheels" / "wheels",
+]
+_WHEELS_DIR = None
+for _candidate in _WHEELS_CANDIDATES:
+    if _candidate.exists() and any(_candidate.glob("*.whl")):
+        _WHEELS_DIR = _candidate
+        break
+
+if _WHEELS_DIR is None:
+    print("ERROR: No wheels directory with .whl files found!")
+    print(f"  Searched: {[str(c) for c in _WHEELS_CANDIDATES]}")
+    print(f"  Contents of {_WEIGHTS_BASE}:")
+    for p in sorted(_WEIGHTS_BASE.rglob("*"))[:30]:
+        print(f"    {p}")
+    raise FileNotFoundError(f"Wheels not found in any of: {_WHEELS_CANDIDATES}")
+
+print(f"Found wheels at: {_WHEELS_DIR}")
+print(f"  Contents: {[p.name for p in _WHEELS_DIR.glob('*.whl')]}")
+try:
+    import cc3d
+    import dijkstra3d
+    print("cc3d and dijkstra3d already available")
+except ImportError:
+    print("Installing cc3d and dijkstra3d from bundled wheels...")
+    subprocess.check_call([
+        sys.executable, "-m", "pip", "install",
+        "--no-index", "--find-links", str(_WHEELS_DIR),
+        "connected-components-3d", "dijkstra3d",
+    ])
+    import cc3d
+    import dijkstra3d
+    print(f"Installed cc3d and dijkstra3d")
+HAS_SURFACE_SPLITTER = True
 import scipy.ndimage as ndi
 
 # ── Paths ──────────────────────────────────────────────────
