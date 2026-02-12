@@ -1,0 +1,17 @@
+{
+  "id": "mgoldfield/vesuvius-surface-detection-inference",
+  "title": "Vesuvius Surface Detection Inference",
+  "code_file": "vesuvius-inference.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": false,
+  "competition_sources": [
+    "vesuvius-challenge-surface-detection"
+  ],
+  "dataset_sources": [
+    "mgoldfield/vesuvius-unet3d-weights"
+  ],
+  "kernel_sources": []
+}

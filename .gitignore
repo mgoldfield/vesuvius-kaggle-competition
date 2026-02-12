@@ -1,0 +1,29 @@
+# Data (too large for git)
+data/train_images/
+data/train_labels/
+data/test_images/
+vesuvius-challenge-surface-detection.zip
+
+# Model weights
+checkpoints/
+pretrained_weights/
+kaggle/kaggle_weights/
+kaggle/submission/
+kaggle/submission.zip
+
+# Python venv
+vesuvius/
+
+# Deprecated data
+deprecated_train_images/
+deprecated_train_labels/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Python
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
