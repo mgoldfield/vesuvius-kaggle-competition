@@ -1,5 +1,12 @@
 # Vesuvius Surface Detection — Project Notes
 
+## Blog Post
+Planning to write a blog post about this project after the competition. These notes should
+capture the full story of iterations — what we tried, why, what worked, what didn't, and
+the key insights along the way (e.g. the inference pipeline discovery, the lr_find struggles,
+the disconnect between val metrics and public scores). Keep recording decision rationale,
+surprising findings, and dead ends — they're all part of the narrative.
+
 ## Competition
 - **Goal:** Detect papyrus surfaces in 3D CT scans of Herculaneum scrolls
 - **Metric:** `0.30*TopoScore + 0.35*SurfaceDice@tau=2 + 0.35*VOI_score`
