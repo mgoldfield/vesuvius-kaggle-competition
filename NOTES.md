@@ -217,7 +217,7 @@ Add `nn.Dropout3d(p=0.2)` after the bottleneck block in UNet3D.forward(), before
   MORE from post-processing (messier predictions = more headroom for cleanup). Track both
   raw and full-pipeline scores side by side to understand this relationship. Don't assume
   the best raw model is the best final model.
-- [ ] **Learned post-processing (refinement network)** — train a lightweight second model that
+- [x] **Learned post-processing (refinement network)** — train a lightweight second model that
   takes the main SegResNet's raw probability map (320^3 float) as input and outputs a refined
   binary segmentation. Replaces all hand-tuned post-processing (hysteresis, closing, splitting)
   with a single forward pass.
@@ -233,6 +233,53 @@ Add `nn.Dropout3d(p=0.2)` after the bottleneck block in UNet3D.forward(), before
     Faster, more generalizable, and differentiable (could eventually be fine-tuned end-to-end
     with the main model).
   - **Kaggle:** Would need to trace this model too and bundle it (~small additional weight file).
+  - **Phase 3 (end-to-end fine-tuning):** Once the refinement model works standalone, make
+    the full pipeline differentiable: main model → refinement model → topology-aware loss.
+    Gradients from the topology loss flow back through both models. This is the ultimate
+    goal — the main model learns to produce outputs that are easy for the refinement model
+    to clean up, and the refinement model learns to fix whatever the main model gets wrong.
+
+### Refinement Model (in progress — Feb 12)
+Training data generation running: v9 model Gaussian SWI inference on all 786 training
+volumes, saving float16 .npy probmaps at `/data/refinement_data/probmaps/` (~63 MB each).
+Script: `scripts/generate_refinement_data.py`. ~2.8s per volume, ~40 min total.
+
+**Notebook:** `notebooks/refinement/vesuvius_train_refinement.ipynb`
+
+**Architecture:** RefinementUNet3D — shallow 3D U-Net, ~365K params
+- Channels: [8, 16, 32, 64], 4 encoder levels
+- GroupNorm, ReLU, Dropout(0.2) at bottleneck
+- Concat skip connections, trilinear upsampling
+- Input: 1ch probmap, Output: 1ch refined logits
+
+**Training setup:**
+- 160^3 random crops from 320^3 probmaps (~2.5 GB VRAM at bs=2)
+- Full 320^3 at inference/metric eval only (forward only, ~1 GB)
+- Augmentations: random flips + 90-degree rotations
+- Phase 1: `fit_one_cycle`, LR=1e-3, 50 epochs, loss=0.5*BCE + 0.5*Dice
+  (from scratch — warmup helps explore loss landscape)
+- Phase 2: `fit_flat_cos`, LR=3.3e-4, 30 epochs, loss=0.2*BCE + 0.2*Dice + 0.3*clDice + 0.3*Boundary
+  (continuing from Phase 1 weights — no warmup to avoid disruption)
+- Metric: RefinementCompetitionMetric — full 320^3 forward pass on 5 val volumes, no SWI needed
+
+**Acceptance criterion:** Head-to-head vs hand-tuned post-processing (hysteresis T_low=0.35,
+T_high=0.80 + anisotropic closing + dust removal) on same probmaps. Must beat it on mean
+comp_score across val set.
+
+**Kaggle deployment:** `torch.jit.trace` → ~1.5 MB traced model. Pipeline:
+main model → Gaussian SWI + logit TTA → probmap → refinement model → threshold 0.5 → done.
+Adds ~0.1s per volume.
+
+### Current plan (Feb 12)
+1. **Refinement model** — training data generation nearly complete (486/786 done, ~15 min
+   remaining). Notebook ready at `notebooks/refinement/vesuvius_train_refinement.ipynb`.
+   Run Phase 1 + Phase 2 training, then head-to-head eval vs hand-tuned post-processing.
+2. **Then end-to-end fine-tuning** — connect main model + refinement model, train jointly
+   with topology-aware losses. Use `fit_flat_cos` schedule (no warmup) with the LR magnitudes
+   from v10b-v2. Train longer (50 epochs) to let the recovery phase play out fully.
+3. **Meanwhile:** Kill eval_inference `--split` (surface splitting takes 80 min/volume —
+   impractical). Rerun without `--split` to get Gaussian SWI + logit TTA comparison quickly.
+   Verify Kaggle inference notebook matches best pipeline.
 
 ### Medium impact, moderate effort
 - [ ] **Attention gates on skip connections** — added in Run 10 but **unverified** due to LR
@@ -267,6 +314,9 @@ Add `nn.Dropout3d(p=0.2)` after the bottleneck block in UNet3D.forward(), before
 - [x] **clDice loss** — added in Run 3. Soft skeletons on 2x-downsampled patches.
 - [x] **Boundary/surface loss** — added in Run 4. Signed distance transform from GT surface.
 - [x] **Post-processing pipeline** — added in Run 7. Hysteresis + anisotropic closing + dust removal.
+- [ ] **`fit_flat_cos` schedule** — replace `fit_one_cycle` for pretrained+new module training.
+  Confirmed in Run 10b-v2: one_cycle warmup disrupts pretrained features, `flat_cos` avoids this.
+  LR magnitudes from v10b-v2 are likely correct (1e-7/1e-6/1e-5/1e-4 per group).
 - [ ] **Cosine annealing** or different LR schedules
 - [ ] **Different loss weighting** — currently 50/50 BCE/Dice. Could try more Dice weight
   since foreground is sparse.
@@ -291,7 +341,7 @@ Add `nn.Dropout3d(p=0.2)` after the bottleneck block in UNet3D.forward(), before
 | Run 9 | Feb 12 (v13) | 0.278 | 0.570 | PENDING | Lower LR (1e-5), T_low=0.40 — Kaggle v13 with surface splitting fix |
 | Run 10 | Feb 12 (v9) | 0.154 | 0.584 | 0.267 | + DS + attn gates — peaked epoch 0, never learned (LR issue) |
 | Run 10b-v1 | — | 0.283 | 0.567 | — | Per-module lr_find valley — still too aggressive, peaked epoch 1 |
-| Run 10b-v2 | — | TBD | TBD | TBD | Hardcoded LRs (eyeballed from lr_find plots) — in progress |
+| Run 10b-v2 | — | 0.159 | 0.581 | — | Hardcoded LRs — loss monotonically decreased, comp_score dipped then recovered (see LR schedule insight) |
 
 **Key insight:** Higher validation dice does NOT equal better competition score. The metric
 (TopoScore + SurfaceDice + VOI) cares about topology and surface quality, not just voxel
@@ -457,7 +507,7 @@ overlap. This is why targeting the loss function and post-processing matters mor
     at the first dip before the steep descent region.
 - **Notebook:** `notebooks/vesuvius_train_v10b.ipynb`
 
-### Run 10b-v2: Hardcoded LRs from lr_find Plots (in progress)
+### Run 10b-v2: Hardcoded LRs from lr_find Plots (complete)
 - **Architecture:** Same SegResNetDSAttn as Run 10
 - **Key change:** Hardcoded LRs eyeballed from the first valley in lr_find plots (~100x
   lower than valley method, consistent 10x spacing between groups):
@@ -469,6 +519,25 @@ overlap. This is why targeting the loss function and post-processing matters mor
   picks too high, causing model to peak at epoch 0-1. Same issue seen in Run 8→9 where
   manually lowering LR 50x fixed early peaking.
 - Everything else same as v10b-v1
+- **Results:** Best comp_score **0.581** at epoch 2. Loss monotonically decreased throughout
+  all 30 epochs (first time!). Comp_score improved epochs 0-2, then dipped during the
+  one_cycle warmup phase, then **started recovering after epoch 11** as LR annealed down.
+  - T_low=0.35 won threshold sweep (dice=0.159)
+  - Verification comp_score (3 volumes): 0.516, 0.430, 0.483 → mean **0.476**
+  - Test volume predicted **0% foreground** (same issue as v10, v10b-v1)
+  - SaveModelCallback only saved epoch 2 — the recovery after epoch 11 was never
+    captured because it didn't exceed 0.581
+- **LR Schedule Insight (important for future runs):**
+  `fit_one_cycle` warmup (epochs 0-9, LR ramping UP) is harmful for pretrained models
+  with new randomly-init modules. The ramp destabilizes pretrained features. The productive
+  learning happened during the annealing phase (epochs 11-30, LR decreasing). This explains
+  the dip-then-recovery pattern.
+  - **Fix:** Use `fit_flat_cos` (flat LR for 75%, cosine anneal for 25%) — no warmup.
+    Or cosine annealing without warmup. The LR magnitudes are likely correct; the schedule
+    is the problem.
+  - **Also:** Save periodic checkpoints (every 3-5 epochs) to capture the recovery phase.
+    The late-epoch models might be better than the epoch 2 "best" after full pipeline eval.
+  - **Also:** Train longer (50 epochs) — the model was still improving when LR hit near-zero.
 - **Notebook:** `notebooks/vesuvius_train_v10b.ipynb` (Cell 18 updated with hardcoded LRs)
 
 ### Run 11: 3-Fold Cross-Validation Ensemble (complete — but LR issue, results unreliable)
@@ -572,18 +641,34 @@ traces + wheels (cp310/311/312 for cc3d + dijkstra3d). Inference script points a
 
 ## Inference Pipeline Evaluation (Feb 12, 2026)
 
-Running `eval_inference.py` with v9 checkpoint to measure the impact of inference pipeline
-improvements. Early results show a **massive** difference:
+Ran `eval_inference.py` with v9 checkpoint. Results (5 val volumes, no surface splitting):
 
-| Pipeline | Vol 26894125 comp_score |
-|----------|----------------------|
-| Old (uniform SWI + prob TTA) | 0.2706 |
-| Old + surface splitting | 0.2706 |
-| New (Gaussian SWI + logit TTA) | 0.5730 |
+| Volume | Old (uniform SWI + prob TTA) | New (Gaussian SWI + logit TTA) | Delta |
+|--------|------------------------------|-------------------------------|-------|
+| 26894125 | 0.271 | 0.573 | +0.302 |
+| 105796630 | 0.548 | 0.548 | +0.001 |
+| 327851248 | 0.241 | 0.241 | +0.000 |
+| 418613908 | 0.241 | 0.576 | +0.335 |
+| 477109023 | 0.235 | 0.552 | +0.317 |
+| **Mean** | **0.307** | **0.498** | **+0.191** |
 
-**Key finding:** Gaussian SWI + logit-space TTA averaging more than doubles the comp_score
-on the first test volume (0.27 → 0.57). This is with the exact same model weights — no
-retraining. Full results (5 volumes × multiple variants × threshold sweep) still running.
+**Key findings:**
+- Gaussian SWI + logit TTA gives **+0.19 mean comp_score** with the same model weights (no retraining).
+- Impact is bimodal: 3/5 volumes get a massive boost (~+0.32), 1 unchanged, 1 negligible.
+- Surface splitting was impractical (~80 min/volume for Dijkstra3D). Killed and excluded.
+
+**Threshold sweep (new pipeline):**
+| T_low | T_high | comp_score |
+|-------|--------|-----------|
+| 0.35 | 0.80 | **0.570** |
+| 0.30 | 0.80 | 0.568 |
+| 0.40 | 0.80 | 0.568 |
+| 0.45 | 0.80 | 0.566 |
+| 0.35 | 0.85 | 0.503 |
+| 0.30 | 0.90 | 0.235 |
+
+**T_high=0.80 beats T_high=0.85** across all T_low values. We've been using 0.85 everywhere.
+Best overall: **T_low=0.35, T_high=0.80 → comp_score 0.570** (vs 0.498 at default thresholds).
 
 ### Implication: Model selection is broken
 The training loop evaluates models using a simplified inference pipeline (basic sliding window,
@@ -817,7 +902,9 @@ Allowed by competition rules. Options:
 │   ├── vesuvius_train_v9.ipynb #   Run 9 (+ lower LR hardcoded)
 │   ├── vesuvius_train_v10.ipynb #  Run 10 (+ deep supervision + attention gates)
 │   ├── vesuvius_train_v10b.ipynb # Run 10b (per-module lr_find)
-│   └── vesuvius_train_v11.ipynb #  Run 11 (3-fold CV ensemble)
+│   ├── vesuvius_train_v11.ipynb #  Run 11 (3-fold CV ensemble)
+│   └── refinement/             #   Refinement (learned post-processing)
+│       └── vesuvius_train_refinement.ipynb  # RefinementUNet3D training
 ├── data/                       # Competition data (not in git)
 │   ├── train_images/           #   786 .tif volumes (320^3 uint8)
 │   ├── train_labels/           #   786 .tif labels (320^3 uint8, values 0/1/2)
@@ -835,6 +922,7 @@ Allowed by competition rules. Options:
 ├── scripts/                    # Automation scripts
 │   ├── trace_model.py          #   Trace SegResNetDSAttn for Kaggle (torch.jit)
 │   ├── eval_inference.py       #   Compare inference pipelines on val set
+│   ├── generate_refinement_data.py  # Generate probmaps for refinement model training
 │   └── overnight_pipeline.sh   #   Overnight: v10 submit → eval inference
 ├── libs/                       # Third-party libraries (not in git)
 │   ├── topological-metrics-kaggle/  # topometrics (Betti matching + scoring)
