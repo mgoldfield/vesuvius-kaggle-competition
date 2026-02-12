@@ -184,6 +184,16 @@ Add `nn.Dropout3d(p=0.2)` after the bottleneck block in UNet3D.forward(), before
   patches are guaranteed to contain foreground.
 - [x] **Test-time augmentation (TTA)** — added in Run 7. 7-fold: original + 3 flips + 3 rotations.
 - [x] **Larger patches** — 160^3 added in Run 7 (was 128^3). Stride=80 for uniform overlap.
+- [ ] **Gaussian-weighted SWI blending** — replace simple overlap averaging with Gaussian
+  importance weighting (center of each patch weighted higher). All top notebooks use this.
+  No retraining needed, just change inference. (from notebook analysis)
+- [ ] **Logit-space TTA averaging** — average raw model outputs before sigmoid, not after.
+  More principled (equivalent to geometric mean in probability space). Free improvement.
+  (from notebook analysis)
+- [x] **Killer ant surface splitting** — raycasting + Dijkstra3D recursive splitting of
+  merged papyrus sheets in post-processing. Model-agnostic, directly targets TopoScore + VOI.
+  Uses `cc3d` + `dijkstra3d`. Integrated into both eval script and Kaggle inference.
+  Wheels bundled in `kaggle/kaggle_weights/wheels/` for offline Kaggle install.
 
 ### Medium impact, moderate effort
 - [x] **Attention gates on skip connections** — added in Run 10. AttentionGate3D at each
@@ -192,20 +202,24 @@ Add `nn.Dropout3d(p=0.2)` after the bottleneck block in UNet3D.forward(), before
   wins competitions. Someone has already preprocessed our data for nnUNetv2 (91.8 GB
   dataset on Kaggle). Would require learning the framework but could yield strong results
   with minimal manual tuning.
-- [ ] **Scroll-level cross-validation** — train 6 folds (one per scroll_id), ensemble
-  predictions. Better use of all data but 6x training time. Could do 3-fold (group small
-  scrolls together) as compromise.
+- [x] **Scroll-level cross-validation** — added in Run 11. 3-fold scroll-grouped CV with
+  probability averaging ensemble.
 - [ ] **Post-processing** — connected component filtering, morphological operations to clean
   up surfaces. Important for TopoScore (rewards continuous surfaces, penalizes holes/mergers).
 - [x] **Deep supervision** — added in Run 10. Auxiliary 1x1 conv heads at decoder levels 0
   (64ch @ D/4) and 1 (32ch @ D/2). Upsampled to full res, supervised with BCE+Dice (weight=0.3).
 - [ ] **Volume caching in RAM** — 786 volumes x 32MB = ~25 GB, fits in 125 GB RAM. Would
   eliminate I/O bottleneck if we're data-loading bound.
+- [ ] **Skeleton recall loss** — add skeleton-based recall term to loss. Pre-compute GT
+  skeleton, penalize missed skeleton voxels. Directly targets TopoScore. (from notebook analysis)
+- [ ] **3D CutOut augmentation** — zero out random cuboid regions during training.
+  Strong regularizer used by top notebooks. (from notebook analysis)
 
 ### Worth experimenting with
 - [ ] **3-class formulation** — predict background/foreground/unlabeled as 3 classes instead
   of binary with mask. The model learns to explicitly predict "unlabeled" regions, which may
-  improve boundary predictions where labeled and unlabeled regions meet.
+  improve boundary predictions where labeled and unlabeled regions meet. All top public
+  notebooks use this approach (0.486→0.505 for TransUNet). (confirmed by notebook analysis)
 - [ ] **Residual connections** in conv blocks (ResBlock instead of plain ConvBlock)
 - [x] **clDice loss** — added in Run 3. Soft skeletons on 2x-downsampled patches.
 - [x] **Boundary/surface loss** — added in Run 4. Signed distance transform from GT surface.
@@ -370,6 +384,75 @@ overlap. This is why targeting the loss function and post-processing matters mor
   Auxiliary outputs: 0.5*BCE + 0.5*Dice, weight=0.3
 - Everything else same as Run 9
 - **Notebook:** `notebooks/vesuvius_train_v10.ipynb`
+
+### Run 11: 3-Fold Cross-Validation Ensemble (queued)
+- **Architecture:** Same SegResNetDSAttn as Run 10 (attention gates + deep supervision)
+- **Key change:** 3-fold scroll-grouped cross-validation with probability averaging ensemble
+  - Fold 0: hold out scrolls 35360 + 53997 (189 val, 597 train) — largest training set first
+  - Fold 1: hold out scrolls 26010 + 26002 + 44430 (235 val, 551 train)
+  - Fold 2: hold out scroll 34117 (382 val, 404 train)
+- **Early stopping:** patience=5 on comp_score per fold (~10-15 epochs expected vs 30 max)
+- **Ensemble inference:** All 3 models predict on each volume, sigmoid probabilities averaged
+  before hysteresis thresholding. With TTA: 3 models × 7 TTA = 21 forward passes per volume.
+- **Kaggle time estimate:** 120 volumes × 21 passes × 27 patches × ~0.03s ≈ 34 min (well within 9hr)
+- **Weights:** ~54 MB total (3 × 18 MB traced models)
+- Everything else same as Run 10
+- **Notebook:** `notebooks/vesuvius_train_v11.ipynb`
+
+## Overnight Pipeline (Feb 12, 2026)
+
+The overnight automation script (`scripts/overnight_pipeline.sh`) runs:
+1. Wait for v10 training to complete (nbconvert PID 8527)
+2. Trace v10 model → upload weights → push Kaggle inference notebook
+3. Run v11 training (3-fold CV via nbconvert)
+4. Trace v11 ensemble models (ready for manual submission)
+
+### Morning Checklist
+1. **Check v10 submission status:**
+   ```bash
+   vesuvius/bin/kaggle kernels status mgoldfield/vesuvius-surface-detection-inference
+   ```
+   If complete, check the public score on the competition page.
+
+2. **Check overnight pipeline log:**
+   ```bash
+   tail -50 logs/overnight.log
+   ```
+
+3. **Review v10 training results:**
+   Open `notebooks/vesuvius_train_v10.ipynb` — look at training curves and comp_score.
+
+4. **Check v11 training status:**
+   - If v11 is still running: `nvidia-smi` and `tail -20 logs/v11_execution.log`
+   - If v11 is done: open `notebooks/vesuvius_train_v11.ipynb` — check fold results summary
+     at the bottom of the training cell, and threshold sweep results.
+
+5. **Submit v11 (if results look good):**
+   ```bash
+   # Update T_LOW in inference script if threshold sweep found a different value
+   cp kaggle/kaggle_notebook/vesuvius-inference-v11.py kaggle/kaggle_notebook/vesuvius-inference.py
+   # Upload ensemble weights
+   vesuvius/bin/kaggle datasets version -p kaggle/kaggle_weights/ -m "v11 ensemble (3-fold CV)"
+   sleep 60
+   # Push inference notebook
+   vesuvius/bin/kaggle kernels push -p kaggle/kaggle_notebook/
+   ```
+
+6. **If v10 scores worse than v9:** Consider reverting to v9 weights and submitting v11
+   ensemble based on v9 architecture instead.
+
+### Key files created overnight:
+- `notebooks/vesuvius_train_v10.ipynb` — v10 training results (executed)
+- `notebooks/vesuvius_train_v11.ipynb` — v11 3-fold CV training results (executed)
+- `checkpoints/models/best_segresnet_v10.pth` — v10 best checkpoint
+- `checkpoints/models/best_segresnet_v11_fold{0,1,2}.pth` — v11 fold checkpoints
+- `kaggle/kaggle_weights/best_segresnet_v10_traced.pt` — v10 traced for Kaggle
+- `kaggle/kaggle_weights/best_segresnet_v11_fold{0,1,2}_traced.pt` — v11 traced for Kaggle
+- `kaggle/kaggle_notebook/vesuvius-inference-v11.py` — ensemble inference script
+- `scripts/trace_model.py` — model tracing utility
+- `scripts/overnight_pipeline.sh` — automation script
+- `libs/topological-metrics-kaggle/` — topometrics library (reinstalled from Kaggle dataset)
+- `logs/overnight.log` — pipeline log
 
 ## Leaderboard Snapshot (Feb 11, 2026)
 
@@ -565,7 +648,8 @@ Allowed by competition rules. Options:
 │   ├── vesuvius_train_v7.ipynb #   Run 7 (+ TTA + hysteresis + 160^3)
 │   ├── vesuvius_train_v8.ipynb #   Run 8 (+ foreground-biased sampling)
 │   ├── vesuvius_train_v9.ipynb #   Run 9 (+ lower LR hardcoded)
-│   └── vesuvius_train_v10.ipynb #  Run 10 (+ deep supervision + attention gates)
+│   ├── vesuvius_train_v10.ipynb #  Run 10 (+ deep supervision + attention gates)
+│   └── vesuvius_train_v11.ipynb #  Run 11 (3-fold CV ensemble)
 ├── data/                       # Competition data (not in git)
 │   ├── train_images/           #   786 .tif volumes (320^3 uint8)
 │   ├── train_labels/           #   786 .tif labels (320^3 uint8, values 0/1/2)
@@ -580,6 +664,18 @@ Allowed by competition rules. Options:
 ├── logs/                       # Training run logs
 ├── NOTES.md                    # This file
 ├── PRETRAINED_MODELS.md        # Pre-trained model research
+├── scripts/                    # Automation scripts
+│   ├── trace_model.py          #   Trace SegResNetDSAttn for Kaggle (torch.jit)
+│   ├── eval_inference.py       #   Compare inference pipelines on val set
+│   └── overnight_pipeline.sh   #   Overnight: v10 submit → eval inference
+├── libs/                       # Third-party libraries (not in git)
+│   ├── topological-metrics-kaggle/  # topometrics (Betti matching + scoring)
+│   └── killer-ant/             # Surface splitting post-processing
+│       ├── process_helper.py   #   Original hengck23 code (reference)
+│       └── surface_splitter.py #   Clean wrapper module
+├── research/                   # Competition research
+│   ├── COMPETITION_NOTEBOOK_ANALYSIS.md  # Analysis of 14 public notebooks
+│   └── notebooks/             #   Downloaded Kaggle notebooks
 ├── CLAUDE.md                   # Claude Code instructions
 └── .gitignore
 ```

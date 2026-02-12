@@ -1,13 +1,14 @@
 # Data (too large for git)
-data/train_images/
-data/train_labels/
-data/test_images/
+train_images/
+train_labels/
+test_images/
 vesuvius-challenge-surface-detection.zip
 
 # Model weights
 checkpoints/
 pretrained_weights/
 kaggle/kaggle_weights/
+kaggle/kaggle_notebook/*.bak
 kaggle/submission/
 kaggle/submission.zip
 
@@ -18,12 +19,24 @@ vesuvius/
 deprecated_train_images/
 deprecated_train_labels/
 
+# Third-party libs (installed from Kaggle datasets, not ours)
+libs/topological-metrics-kaggle/
+libs/wheels/
+libs/killer-ant/process_helper.py
+
+# Downloaded research notebooks (large, from Kaggle)
+research/notebooks/
+
+# Logs
+logs/
+
 # Jupyter
 .ipynb_checkpoints/
 
 # Python
 __pycache__/
 *.pyc
+*.egg-info/
 
 # OS
 .DS_Store

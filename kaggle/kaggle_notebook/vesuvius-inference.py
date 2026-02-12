@@ -1,9 +1,11 @@
 """
 Vesuvius Challenge - Surface Detection: Inference Notebook
 SegResNet sliding window inference on test volumes.
-Run 9: Lower LR (1e-5) + FG-biased sampling + TTA + hysteresis + 160^3.
+Inference v3: Gaussian SWI + logit TTA + hysteresis + surface splitting + 160^3.
 Model exported via torch.jit.trace (no MONAI dependency needed).
 """
+import subprocess
+import sys
 import torch
 import numpy as np
 from PIL import Image
@@ -15,6 +17,30 @@ from scipy.ndimage import (
     generate_binary_structure, binary_propagation,
     binary_closing, label as scipy_label,
 )
+
+# ── Install surface splitting dependencies from bundled wheels ──
+_WHEELS_DIR = Path("/kaggle/input/vesuvius-unet3d-weights/wheels")
+HAS_SURFACE_SPLITTER = False
+if _WHEELS_DIR.exists():
+    try:
+        import cc3d
+        import dijkstra3d
+        HAS_SURFACE_SPLITTER = True
+        print("cc3d and dijkstra3d already available")
+    except ImportError:
+        print("Installing cc3d and dijkstra3d from bundled wheels...")
+        subprocess.check_call([
+            sys.executable, "-m", "pip", "install",
+            "--no-index", "--find-links", str(_WHEELS_DIR),
+            "connected-components-3d", "dijkstra3d",
+        ])
+        import cc3d
+        import dijkstra3d
+        HAS_SURFACE_SPLITTER = True
+        print(f"Installed cc3d {cc3d.__version__}, dijkstra3d")
+else:
+    print("No wheels directory found, surface splitting disabled")
+import scipy.ndimage as ndi
 
 # ── Paths ──────────────────────────────────────────────────
 WEIGHTS_DIR = Path("/kaggle/input/vesuvius-unet3d-weights")
@@ -32,6 +58,7 @@ CLOSING_Z_RADIUS = 2
 CLOSING_XY_RADIUS = 1
 DUST_MIN_SIZE = 100
 USE_TTA = True
+USE_SURFACE_SPLIT = True  # split merged papyrus sheets (requires cc3d + dijkstra3d)
 
 print(f"Device: {DEVICE}")
 if torch.cuda.is_available():
@@ -39,6 +66,7 @@ if torch.cuda.is_available():
 print(f"Patch size: {PATCH_SIZE}^3, Stride: {STRIDE}")
 print(f"Hysteresis: T_low={T_LOW}, T_high={T_HIGH}")
 print(f"TTA: {'ON (7-fold)' if USE_TTA else 'OFF'}")
+print(f"Surface splitting: {'ON' if USE_SURFACE_SPLIT and HAS_SURFACE_SPLITTER else 'OFF'}")
 
 # ── Load Model (traced — no MONAI needed) ──────────────────
 weights_path = WEIGHTS_DIR / "best_segresnet_v9_traced.pt"
@@ -64,17 +92,43 @@ def write_tiff_volume(path, volume):
     frames[0].save(path, save_all=True, append_images=frames[1:])
 
 
-# ── Sliding Window Inference ───────────────────────────────
+# ── Gaussian Importance Map ───────────────────────────────
+def _build_gaussian_map(patch_size, sigma_scale=0.125):
+    """
+    Build a 3D Gaussian importance map for SWI blending.
+    Center voxels get weight ~1.0, edges taper to near-zero.
+    sigma_scale: fraction of patch_size for Gaussian sigma (0.125 = MONAI default).
+    """
+    sigma = patch_size * sigma_scale
+    ax = np.arange(patch_size, dtype=np.float32)
+    center = (patch_size - 1) / 2.0
+    gauss_1d = np.exp(-0.5 * ((ax - center) / sigma) ** 2)
+    gauss_3d = gauss_1d[:, None, None] * gauss_1d[None, :, None] * gauss_1d[None, None, :]
+    # Normalize so max is 1.0 (avoids numerical issues)
+    gauss_3d /= gauss_3d.max()
+    # Clamp to small positive value to avoid division by zero
+    gauss_3d = np.clip(gauss_3d, 1e-6, None)
+    return gauss_3d
+
+
+# Pre-build the Gaussian map (reused for all patches)
+GAUSSIAN_MAP = _build_gaussian_map(PATCH_SIZE)
+print(f"Gaussian importance map: min={GAUSSIAN_MAP.min():.4f}, max={GAUSSIAN_MAP.max():.4f}")
+
+
+# ── Sliding Window Inference (Gaussian-weighted, returns logits) ──
 def sliding_window_inference(model, volume, patch_size=160, stride=80, device="cuda"):
     """
     Run inference on a full 320^3 volume using overlapping patches.
-    Overlapping regions are averaged for smoother predictions.
+    Uses Gaussian importance weighting for smooth blending (center > edges).
+    Returns raw logits (pre-sigmoid) for logit-space TTA averaging.
     """
     D, H, W = volume.shape
     ps = patch_size
+    gauss = GAUSSIAN_MAP
 
     output = np.zeros((D, H, W), dtype=np.float32)
-    counts = np.zeros((D, H, W), dtype=np.float32)
+    weights = np.zeros((D, H, W), dtype=np.float32)
 
     def _positions(length, ps, stride):
         pos = list(range(0, length - ps, stride))
@@ -92,38 +146,41 @@ def sliding_window_inference(model, volume, patch_size=160, stride=80, device="c
                 for x in x_pos:
                     patch = volume[z:z+ps, y:y+ps, x:x+ps]
                     patch_t = torch.from_numpy(patch).float().unsqueeze(0).unsqueeze(0).to(device) / 255.0
-                    logits = model(patch_t)
-                    prob = torch.sigmoid(logits).squeeze().cpu().numpy()
-                    output[z:z+ps, y:y+ps, x:x+ps] += prob
-                    counts[z:z+ps, y:y+ps, x:x+ps] += 1.0
+                    logits = model(patch_t).squeeze().cpu().numpy()
+                    output[z:z+ps, y:y+ps, x:x+ps] += logits * gauss
+                    weights[z:z+ps, y:y+ps, x:x+ps] += gauss
 
-    output /= counts
-    return output
+    output /= weights
+    return output  # raw logits, not probabilities
 
 
-# ── TTA: 7-fold test-time augmentation ─────────────────────
+# ── TTA: 7-fold test-time augmentation (logit-space) ──────
 def sliding_window_inference_tta(model, volume, patch_size=160, stride=80, device="cuda"):
     """
     7-fold TTA: original + 3 axis flips + 3 HW-plane rotations (90/180/270).
+    Averages in logit space (before sigmoid) for more principled aggregation.
+    Returns probability map (sigmoid applied after averaging logits).
     """
-    probs = []
+    logits_sum = np.zeros_like(volume, dtype=np.float32)
 
     # 1. Original
-    probs.append(sliding_window_inference(model, volume, patch_size, stride, device))
+    logits_sum += sliding_window_inference(model, volume, patch_size, stride, device)
 
     # 2-4. Axis flips (z, y, x)
     for axis in range(3):
         flipped = np.flip(volume, axis=axis).copy()
-        prob = sliding_window_inference(model, flipped, patch_size, stride, device)
-        probs.append(np.flip(prob, axis=axis).copy())
+        logits = sliding_window_inference(model, flipped, patch_size, stride, device)
+        logits_sum += np.flip(logits, axis=axis).copy()
 
     # 5-7. HW-plane (axes 1,2) rotations: 90, 180, 270 degrees
     for k in [1, 2, 3]:
         rotated = np.rot90(volume, k=k, axes=(1, 2)).copy()
-        prob = sliding_window_inference(model, rotated, patch_size, stride, device)
-        probs.append(np.rot90(prob, k=-k, axes=(1, 2)).copy())
+        logits = sliding_window_inference(model, rotated, patch_size, stride, device)
+        logits_sum += np.rot90(logits, k=-k, axes=(1, 2)).copy()
 
-    return np.mean(probs, axis=0)
+    # Average logits, then apply sigmoid
+    mean_logits = logits_sum / 7.0
+    return 1.0 / (1.0 + np.exp(-mean_logits))  # sigmoid
 
 
 # ── Hysteresis thresholding ────────────────────────────────
@@ -170,11 +227,141 @@ def postprocess(probs, t_low=0.35, t_high=0.85, z_radius=2, xy_radius=1, min_siz
     return closed.astype(np.uint8)
 
 
+# ── Surface Splitting (Killer Ant algorithm) ─────────────────
+# Adapted from hengck23's "Marching Ants" post-processing.
+# Detects merged papyrus sheets via raycasting and splits them
+# using Dijkstra3D shortest paths. Directly improves TopoScore + VOI.
+
+SPLIT_RAYCAST_IOU = 0.1
+SPLIT_RANGE = 20
+SPLIT_MIN_POINTS = 8
+SPLIT_MAX_TRIAL = 100
+SPLIT_REMOVE_THR = 0.9
+SPLIT_MAX_DEPTH = 50
+
+
+def _split_range_intervals(d, min_size=64):
+    k = max(1, d // min_size)
+    edges = np.linspace(0, d, k + 1, dtype=int)
+    edges[-1] = d
+    return [(edges[i], edges[i + 1]) for i in range(k)]
+
+
+def _raycast_iou(p1, p2, h, w):
+    """Check if two 2D point sets (Nx2, yx format) overlap in YX projection."""
+    by1 = np.bincount(p1[:, 0], minlength=h)
+    by2 = np.bincount(p2[:, 0], minlength=h)
+    bx1 = np.bincount(p1[:, 1], minlength=w)
+    bx2 = np.bincount(p2[:, 1], minlength=w)
+    combined1 = np.concatenate([by1, bx1]) != 0
+    combined2 = np.concatenate([by2, bx2]) != 0
+    inter = (combined1 & combined2).sum()
+    union = (combined1 | combined2).sum()
+    return inter / (union + 1e-6)
+
+
+def _find_multi_surface_seeds(component):
+    """Detect if a 3D component contains multiple overlapping surfaces."""
+    d, h, w = component.shape
+    for z1, z2 in _split_range_intervals(d, min_size=SPLIT_RANGE):
+        z = (z1 + z2) // 2
+        ccz = cc3d.connected_components(component[z])
+        points = []
+        for i in range(1, ccz.max() + 1):
+            p = np.stack(np.where(ccz == i)).T
+            if len(p) >= SPLIT_MIN_POINTS:
+                points.append(p)
+        if len(points) <= 1:
+            continue
+        for i1 in range(len(points)):
+            for i2 in range(i1 + 1, len(points)):
+                if _raycast_iou(points[i1], points[i2], h, w) >= SPLIT_RAYCAST_IOU:
+                    z_col = np.full((len(points[i1]), 1), z, dtype=points[i1].dtype)
+                    p1_zyx = np.concatenate([z_col, points[i1]], -1)
+                    z_col2 = np.full((len(points[i2]), 1), z, dtype=points[i2].dtype)
+                    p2_zyx = np.concatenate([z_col2, points[i2]], -1)
+                    return True, p1_zyx, p2_zyx
+    return False, None, None
+
+
+def _split_component(component, p1_zyx, p2_zyx):
+    """Split a component into two via Dijkstra path removal."""
+    problem = component.copy()
+    for trial in range(SPLIT_MAX_TRIAL):
+        paths = []
+        k1 = np.arange(len(p1_zyx))
+        np.random.shuffle(k1)
+        for (sz, sy, sx) in p1_zyx[k1[:8]]:
+            parent = dijkstra3d.parental_field(
+                np.where(problem, 1.0, 1e6).astype(np.float32),
+                source=(sz, sy, sx), connectivity=26)
+            k2 = np.arange(len(p2_zyx))
+            np.random.shuffle(k2)
+            for (ez, ey, ex) in p2_zyx[k2[:8]]:
+                paths.append(dijkstra3d.path_from_parents(parent, (ez, ey, ex)))
+        path_flat = np.concatenate(paths)
+        if np.any(~problem[path_flat[:, 0], path_flat[:, 1], path_flat[:, 2]]):
+            return True, cc3d.connected_components(problem)
+        uniq, cnt = np.unique(path_flat, axis=0, return_counts=True)
+        order = np.argsort(-cnt)
+        uniq, cnt = uniq[order], cnt[order]
+        threshold = SPLIT_REMOVE_THR * cnt.max()
+        u = uniq[cnt >= threshold]
+        larger = np.zeros_like(problem, dtype=bool)
+        larger[u[:, 0], u[:, 1], u[:, 2]] = True
+        larger = ndi.binary_dilation(larger, structure=np.ones((3, 3, 3), dtype=bool), iterations=1)
+        problem[larger] = False
+    return False, problem
+
+
+def _recursive_split(component, result, depth=0):
+    """Recursively split until each piece is a single surface."""
+    if depth >= SPLIT_MAX_DEPTH:
+        result.append(component)
+        return
+    is_multi, p1, p2 = _find_multi_surface_seeds(component)
+    if not is_multi:
+        result.append(component)
+        return
+    success, solved = _split_component(component, p1, p2)
+    if not success:
+        result.append(component)
+        return
+    _recursive_split(solved == 1, result, depth + 1)
+    _recursive_split(solved == 2, result, depth + 1)
+
+
+def split_merged_surfaces(binary_mask, min_size=100):
+    """Split merged papyrus sheets in a binary mask. Returns binary uint8."""
+    labeled = cc3d.connected_components(binary_mask.astype(np.uint8))
+    n = labeled.max()
+    if n == 0:
+        return binary_mask
+    surfaces = []
+    for cid in range(1, n + 1):
+        comp = (labeled == cid)
+        if comp.sum() < min_size:
+            surfaces.append(comp)
+            continue
+        result = []
+        _recursive_split(comp, result)
+        surfaces.extend(result)
+    output = np.zeros_like(binary_mask, dtype=np.uint8)
+    for s in surfaces:
+        output[s > 0] = 1
+    return output
+
+
 # ── Run on Test Volumes ────────────────────────────────────
 test_df = pd.read_csv(DATA_DIR / "test.csv")
 print(f"\nTest volumes: {len(test_df)}")
 
-infer_fn = sliding_window_inference_tta if USE_TTA else sliding_window_inference
+def sliding_window_inference_prob(model, volume, patch_size=160, stride=80, device="cuda"):
+    """Non-TTA path: sliding window returning probabilities (sigmoid applied)."""
+    logits = sliding_window_inference(model, volume, patch_size, stride, device)
+    return 1.0 / (1.0 + np.exp(-logits))
+
+infer_fn = sliding_window_inference_tta if USE_TTA else sliding_window_inference_prob
 
 for i, row in test_df.iterrows():
     vol_id = row.id
@@ -190,6 +377,9 @@ for i, row in test_df.iterrows():
     pred = postprocess(prob, t_low=T_LOW, t_high=T_HIGH,
                        z_radius=CLOSING_Z_RADIUS, xy_radius=CLOSING_XY_RADIUS,
                        min_size=DUST_MIN_SIZE)
+
+    if USE_SURFACE_SPLIT and HAS_SURFACE_SPLITTER:
+        pred = split_merged_surfaces(pred, min_size=DUST_MIN_SIZE)
 
     out_path = SUBMISSION_DIR / f"{vol_id}.tif"
     write_tiff_volume(out_path, pred)

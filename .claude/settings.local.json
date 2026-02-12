@@ -53,7 +53,18 @@
       "Bash(unzip:*)",
       "WebFetch(domain:hboon.com)",
       "Bash(find:*)",
-      "Bash(/home/mongomatt/Projects/vesuvius/vesuvius/bin/python3:*)"
+      "Bash(/home/mongomatt/Projects/vesuvius/vesuvius/bin/python3:*)",
+      "Bash(grep:*)",
+      "Bash(curl:*)",
+      "Bash(# Also search for the original metrics source in the project directory find /home/mongomatt/Projects/vesuvius/ -name \"\"*.zip\"\" -o -name \"\"*.tar.gz\"\")",
+      "Bash(__NEW_LINE_2860f1c8a775f78e__ cmake --build . --parallel)",
+      "Bash(echo:*)",
+      "Bash(ln:*)",
+      "Bash(pip uninstall:*)",
+      "Bash(kaggle datasets download:*)",
+      "Bash(kaggle kernels output:*)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(pip download:*)"
     ]
   }
 }
