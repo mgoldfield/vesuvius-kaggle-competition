@@ -201,6 +201,32 @@ Add `nn.Dropout3d(p=0.2)` after the bottleneck block in UNet3D.forward(), before
   **Status:** Code integrated but never evaluated on val set. `eval_inference.py --split`
   will measure impact. Kaggle wheels upload also failed (missing `--dir-mode zip`).
 
+### Inference pipeline & model selection
+- [ ] **Periodic checkpoint saving** — save every N epochs during training, not just "best".
+  After training, run full inference pipeline (Gaussian SWI + logit TTA + hysteresis + splitting)
+  on all saved checkpoints via `eval_inference.py` to find the true best. Lightweight training
+  metric is directional only — final selection uses the real pipeline.
+- [ ] **Track raw vs post-processed scores** — models with lower raw comp_score may benefit
+  MORE from post-processing (messier predictions = more headroom for cleanup). Track both
+  raw and full-pipeline scores side by side to understand this relationship. Don't assume
+  the best raw model is the best final model.
+- [ ] **Learned post-processing (refinement network)** — train a lightweight second model that
+  takes the main SegResNet's raw probability map (320^3 float) as input and outputs a refined
+  binary segmentation. Replaces all hand-tuned post-processing (hysteresis, closing, splitting)
+  with a single forward pass.
+  - **Phase 1:** Train with GT labels as target, using the main model's predictions as input.
+    Generate training pairs by running main model inference on all 786 training volumes.
+    Architecture can be very small (e.g. shallow 3D U-Net or even 2D slice-wise) since it's
+    refining, not segmenting from scratch.
+  - **Phase 2:** Swap in topology-aware loss functions that are too expensive for the main
+    training loop — persistent homology loss, direct Betti matching, surface-distance loss,
+    etc. The refinement model's only job is to fix topology, so these losses are well-targeted.
+    Could push beyond what hand-tuned post-processing achieves.
+  - **Inference:** Single lightweight forward pass replaces the entire post-processing pipeline.
+    Faster, more generalizable, and differentiable (could eventually be fine-tuned end-to-end
+    with the main model).
+  - **Kaggle:** Would need to trace this model too and bundle it (~small additional weight file).
+
 ### Medium impact, moderate effort
 - [ ] **Attention gates on skip connections** — added in Run 10 but **unverified** due to LR
   issue (new modules couldn't learn). Re-testing in Run 10b with per-module lr_find.
@@ -255,8 +281,8 @@ Add `nn.Dropout3d(p=0.2)` after the bottleneck block in UNet3D.forward(), before
 | Run 2 | Feb 10 | 0.172 | — | 0.290 | GroupNorm + Dropout — worse score despite better dice! |
 | Run 3 | Feb 10 | 0.281 | — | 0.348 | SegResNet + clDice |
 | Run 8 | Feb 11 | 0.276 | 0.562 | 0.423 | FG-biased sampling + TTA + hysteresis (LR too high — peaked epoch 1) |
-| Run 9 | Feb 12 (v13) | 0.278 | 0.570 | TBD | Lower LR (1e-5), T_low=0.40 — Kaggle v13 with surface splitting fix |
-| Run 10 | — | 0.154 | 0.584 | — | + DS + attn gates — peaked epoch 0, never learned (LR issue) |
+| Run 9 | Feb 12 (v13) | 0.278 | 0.570 | PENDING | Lower LR (1e-5), T_low=0.40 — Kaggle v13 with surface splitting fix |
+| Run 10 | Feb 12 (v9) | 0.154 | 0.584 | 0.267 | + DS + attn gates — peaked epoch 0, never learned (LR issue) |
 | Run 10b-v1 | — | 0.283 | 0.567 | — | Per-module lr_find valley — still too aggressive, peaked epoch 1 |
 | Run 10b-v2 | — | TBD | TBD | TBD | Hardcoded LRs (eyeballed from lr_find plots) — in progress |
 
@@ -471,7 +497,8 @@ The overnight automation script (`scripts/overnight_pipeline.sh`) ran:
 | v9 | v10 traced | Feb 12 ~02:32 | ERROR | Overnight pipeline — v10 weights (bad, peaked epoch 0) |
 | v10-v11 | — | — | — | Unknown / intermediate |
 | v12 | v9 traced | Feb 12 | ERROR | Fixed wheels (cp312) but `cc3d.__version__` crash |
-| v13 | v9 traced | Feb 12 | SUBMITTED | Fixed cc3d version print — first real v9 submission |
+| v13 | v9 traced | Feb 12 | SUBMITTED/PENDING | Fixed cc3d version print — first real v9 submission |
+| v14 | v9 traced | Feb 12 | PENDING | "finally submit local v9" — two pending submissions |
 
 Weights dataset uploaded Feb 12 with `--dir-mode zip`: v9 traced + v10 traced + v11 fold
 traces + wheels (cp310/311/312 for cc3d + dijkstra3d). Inference script points at
@@ -535,6 +562,39 @@ traces + wheels (cp310/311/312 for cc3d + dijkstra3d). Inference script points a
 - `scripts/overnight_pipeline.sh` — automation script
 - `libs/topological-metrics-kaggle/` — topometrics library (reinstalled from Kaggle dataset)
 - `logs/overnight.log` — pipeline log
+
+## Inference Pipeline Evaluation (Feb 12, 2026)
+
+Running `eval_inference.py` with v9 checkpoint to measure the impact of inference pipeline
+improvements. Early results show a **massive** difference:
+
+| Pipeline | Vol 26894125 comp_score |
+|----------|----------------------|
+| Old (uniform SWI + prob TTA) | 0.2706 |
+| Old + surface splitting | 0.2706 |
+| New (Gaussian SWI + logit TTA) | 0.5730 |
+
+**Key finding:** Gaussian SWI + logit-space TTA averaging more than doubles the comp_score
+on the first test volume (0.27 → 0.57). This is with the exact same model weights — no
+retraining. Full results (5 volumes × multiple variants × threshold sweep) still running.
+
+### Implication: Model selection is broken
+The training loop evaluates models using a simplified inference pipeline (basic sliding window,
+no TTA, simple threshold). But the actual Kaggle submission uses the full pipeline. The model
+that looks best during training may not be the best after full inference post-processing.
+
+**Current plan:**
+- **Periodic checkpoint saving** — save every N epochs, not just "best" by lightweight metric
+- **Post-training eval sweep** — after training, run full pipeline (Gaussian SWI + logit TTA +
+  hysteresis + surface splitting) on all saved checkpoints via `eval_inference.py`
+- **Pick the true best** checkpoint based on full-pipeline comp_score
+- This decouples model selection from training — lightweight metric still useful as directional
+  signal during training, but final selection uses the real pipeline
+
+### Implication: Kaggle inference pipeline matters more than model architecture
+If the inference pipeline accounts for a 2x comp_score difference, ensuring the Kaggle notebook
+uses the correct pipeline (Gaussian SWI + logit TTA) is potentially more impactful than any
+model change. Need to verify the Kaggle inference script matches the "new" pipeline exactly.
 
 ## Leaderboard Snapshot (Feb 11, 2026)
 
