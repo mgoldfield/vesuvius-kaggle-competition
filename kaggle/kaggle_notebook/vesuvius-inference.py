@@ -68,13 +68,13 @@ SUBMISSION_DIR.mkdir(exist_ok=True, parents=True)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 PATCH_SIZE = 160
 STRIDE = 80
-T_LOW = 0.40
-T_HIGH = 0.85
+T_LOW = 0.35
+T_HIGH = 0.80
 CLOSING_Z_RADIUS = 2
 CLOSING_XY_RADIUS = 1
 DUST_MIN_SIZE = 100
 USE_TTA = True
-USE_SURFACE_SPLIT = True  # split merged papyrus sheets (requires cc3d + dijkstra3d)
+USE_SURFACE_SPLIT = False  # disabled — never evaluated, too slow (~80 min/vol on P100)
 
 print(f"Device: {DEVICE}")
 if torch.cuda.is_available():

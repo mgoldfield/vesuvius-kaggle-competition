@@ -1,0 +1,36 @@
+[{"stream_name":"stdout","time":8.399862177,"data":"Found wheels at: /kaggle/input/vesuvius-unet3d-weights/wheels\n"}
+,{"stream_name":"stdout","time":8.400417197,"data":"  Contents: ['connected_components_3d-3.26.1-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl', 'connected_components_3d-3.26.1-cp310-cp310-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl', 'dijkstra3d-1.15.2-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl', 'dijkstra3d-1.15.2-cp311-cp311-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl', 'connected_components_3d-3.26.1-cp311-cp311-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl', 'dijkstra3d-1.15.2-cp310-cp310-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl']\n"}
+,{"stream_name":"stdout","time":8.400556475,"data":"Installing cc3d and dijkstra3d from bundled wheels...\n"}
+,{"stream_name":"stdout","time":10.526102357,"data":"Looking in links: /kaggle/input/vesuvius-unet3d-weights/wheels\n"}
+,{"stream_name":"stdout","time":10.572456134,"data":"Processing /kaggle/input/vesuvius-unet3d-weights/wheels/connected_components_3d-3.26.1-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl\n"}
+,{"stream_name":"stdout","time":10.65811937,"data":"Processing /kaggle/input/vesuvius-unet3d-weights/wheels/dijkstra3d-1.15.2-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl\n"}
+,{"stream_name":"stdout","time":10.726567129,"data":"Requirement already satisfied: numpy in /usr/local/lib/python3.12/dist-packages (from connected-components-3d) (2.0.2)\n"}
+,{"stream_name":"stdout","time":12.776863032,"data":"Installing collected packages: dijkstra3d, connected-components-3d\n"}
+,{"stream_name":"stdout","time":12.996900651,"data":"Successfully installed connected-components-3d-3.26.1 dijkstra3d-1.15.2\n"}
+,{"stream_name":"stdout","time":13.067687247,"data":"Installed cc3d and dijkstra3d\n"}
+,{"stream_name":"stdout","time":13.109893621,"data":"Device: cuda\n"}
+,{"stream_name":"stdout","time":13.131523282,"data":"GPU: Tesla P100-PCIE-16GB\n"}
+,{"stream_name":"stdout","time":13.131546463,"data":"Patch size: 160^3, Stride: 80\n"}
+,{"stream_name":"stdout","time":13.131549895,"data":"Hysteresis: T_low=0.4, T_high=0.85\n"}
+,{"stream_name":"stdout","time":13.131552395,"data":"TTA: ON (7-fold)\n"}
+,{"stream_name":"stdout","time":13.131554787,"data":"Surface splitting: ON\n"}
+,{"stream_name":"stdout","time":13.617539618,"data":"Model loaded from /kaggle/input/vesuvius-unet3d-weights/best_segresnet_v9_traced.pt\n"}
+,{"stream_name":"stdout","time":13.639721041,"data":"Gaussian importance map: min=0.0000, max=1.0000\n"}
+,{"stream_name":"stdout","time":13.65493813,"data":"\n"}
+,{"stream_name":"stdout","time":13.654964409,"data":"Test volumes: 1\n"}
+,{"stream_name":"stdout","time":71.29416315,"data":"  [1/1] Predicting 1407735... fg=0/32768000 (0.0%) [57.6s]\n"}
+,{"stream_name":"stdout","time":71.294220035,"data":"\n"}
+,{"stream_name":"stdout","time":71.294225198,"data":"Inference complete.\n"}
+,{"stream_name":"stdout","time":71.496552119,"data":"\n"}
+,{"stream_name":"stdout","time":71.496582137,"data":"Submission: /kaggle/working/submission.zip\n"}
+,{"stream_name":"stdout","time":71.49659014,"data":"Size: 0.0 MB\n"}
+,{"stream_name":"stdout","time":71.496712953,"data":"Files: 1\n"}
+,{"stream_name":"stderr","time":74.999146857,"data":"/usr/local/lib/python3.12/dist-packages/mistune.py:435: SyntaxWarning: invalid escape sequence '\\|'\n"}
+,{"stream_name":"stderr","time":74.999198324,"data":"  cells[i][c] = re.sub('\\\\\\\\\\|', '|', cell)\n"}
+,{"stream_name":"stderr","time":75.263709279,"data":"/usr/local/lib/python3.12/dist-packages/nbconvert/filters/filter_links.py:36: SyntaxWarning: invalid escape sequence '\\_'\n"}
+,{"stream_name":"stderr","time":75.263739767,"data":"  text = re.sub(r'_', '\\_', text) # Escape underscores in display text\n"}
+,{"stream_name":"stderr","time":75.969132925,"data":"/usr/local/lib/python3.12/dist-packages/traitlets/traitlets.py:2915: FutureWarning: --Exporter.preprocessors=[\"nbconvert.preprocessors.ExtractOutputPreprocessor\"] for containers is deprecated in traitlets 5.0. You can pass `--Exporter.preprocessors item` ... multiple times to add items to a list.\n"}
+,{"stream_name":"stderr","time":75.969168325,"data":"  warn(\n"}
+,{"stream_name":"stderr","time":76.011791157,"data":"[NbConvertApp] Converting notebook __script__.ipynb to html\n"}
+,{"stream_name":"stderr","time":77.324502536,"data":"[NbConvertApp] Writing 355842 bytes to __results__.html\n"}
+]

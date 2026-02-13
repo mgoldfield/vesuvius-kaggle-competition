@@ -239,10 +239,9 @@ Add `nn.Dropout3d(p=0.2)` after the bottleneck block in UNet3D.forward(), before
     goal — the main model learns to produce outputs that are easy for the refinement model
     to clean up, and the refinement model learns to fix whatever the main model gets wrong.
 
-### Refinement Model (in progress — Feb 12)
-Training data generation running: v9 model Gaussian SWI inference on all 786 training
-volumes, saving float16 .npy probmaps at `/data/refinement_data/probmaps/` (~63 MB each).
-Script: `scripts/generate_refinement_data.py`. ~2.8s per volume, ~40 min total.
+### Refinement Model (training overnight — Feb 12)
+Training data: v9 model Gaussian SWI inference on all 786 training volumes, float16 .npy
+probmaps at `/data/refinement_data/probmaps/` (~63 MB each). Generation complete.
 
 **Notebook:** `notebooks/refinement/vesuvius_train_refinement.ipynb`
 
@@ -253,14 +252,31 @@ Script: `scripts/generate_refinement_data.py`. ~2.8s per volume, ~40 min total.
 - Input: 1ch probmap, Output: 1ch refined logits
 
 **Training setup:**
-- 160^3 random crops from 320^3 probmaps (~2.5 GB VRAM at bs=2)
-- Full 320^3 at inference/metric eval only (forward only, ~1 GB)
+- 128^3 random crops from 320^3 probmaps (reduced from 160^3 — PCIe workaround)
+- Full 320^3 at inference/metric eval only (forward only on CPU, ~5s per volume)
 - Augmentations: random flips + 90-degree rotations
 - Phase 1: `fit_one_cycle`, LR=1e-3, 50 epochs, loss=0.5*BCE + 0.5*Dice
   (from scratch — warmup helps explore loss landscape)
+  Model selection: **lowest valid_loss** (not comp_score — see below)
 - Phase 2: `fit_flat_cos`, LR=3.3e-4, 30 epochs, loss=0.2*BCE + 0.2*Dice + 0.3*clDice + 0.3*Boundary
   (continuing from Phase 1 weights — no warmup to avoid disruption)
-- Metric: RefinementCompetitionMetric — full 320^3 forward pass on 5 val volumes, no SWI needed
+  Model selection: best comp_score (appropriate here — model already has structure)
+- Metric: RefinementCompetitionMetric — full 320^3 CPU forward pass on 5 val volumes
+
+**Phase 1 model selection insight:** First training attempt (before crash) showed the same
+early-peaking pattern as v10b-v2: comp_score peaks at epoch 0-1, dips during one_cycle
+warmup, then slowly recovers but never exceeds the early peak. The early "best" is
+essentially a near-init model with no real structure — bad for Phase 2 handoff. Switched
+to saving by lowest valid_loss so Phase 2 gets a model with fully developed representations.
+
+**PCIe workaround (faulty link — Feb 12):** The RTX 5090's PCIe link is unstable under
+sustained high-bandwidth transfers. The refinement model trains much faster per step than
+the 4.7M-param SegResNet (~10x), so data transfers happen more frequently, overwhelming
+the link. First training attempt crashed at epoch 15. Mitigations applied:
+- Compact dtypes: probmaps as float16 (native), labels as uint8 (native), mask/label
+  derived on GPU. Per-batch transfer: ~12.6 MB (was ~131 MB) — **~10x reduction**.
+- No prefetching: `num_workers=0`, `pin_memory=False` — eliminates burst transfers.
+- Smaller patches: 128^3 (was 160^3) — 49% less data per patch.
 
 **Acceptance criterion:** Head-to-head vs hand-tuned post-processing (hysteresis T_low=0.35,
 T_high=0.80 + anisotropic closing + dust removal) on same probmaps. Must beat it on mean
@@ -270,16 +286,17 @@ comp_score across val set.
 main model → Gaussian SWI + logit TTA → probmap → refinement model → threshold 0.5 → done.
 Adds ~0.1s per volume.
 
-### Current plan (Feb 12)
-1. **Refinement model** — training data generation nearly complete (486/786 done, ~15 min
-   remaining). Notebook ready at `notebooks/refinement/vesuvius_train_refinement.ipynb`.
-   Run Phase 1 + Phase 2 training, then head-to-head eval vs hand-tuned post-processing.
-2. **Then end-to-end fine-tuning** — connect main model + refinement model, train jointly
+### Current plan (overnight Feb 12 → morning Feb 13)
+1. **Refinement model training running overnight** via nbconvert in tmux.
+   Phase 1 (50 epochs) + Phase 2 (30 epochs) + head-to-head eval + Kaggle trace export.
+   Log: `logs/refinement_training.log`
+2. **Morning check:** Verify training completed. Check Phase 1 loss curve (should decrease
+   monotonically). Check Phase 2 comp_score. Check head-to-head results vs hand-tuned
+   baseline. If refinement wins → upload traced model + update Kaggle inference notebook.
+3. **Then end-to-end fine-tuning** — connect main model + refinement model, train jointly
    with topology-aware losses. Use `fit_flat_cos` schedule (no warmup) with the LR magnitudes
    from v10b-v2. Train longer (50 epochs) to let the recovery phase play out fully.
-3. **Meanwhile:** Kill eval_inference `--split` (surface splitting takes 80 min/volume —
-   impractical). Rerun without `--split` to get Gaussian SWI + logit TTA comparison quickly.
-   Verify Kaggle inference notebook matches best pipeline.
+4. **Meanwhile:** Verify Kaggle inference notebook matches best pipeline.
 
 ### Medium impact, moderate effort
 - [ ] **Attention gates on skip connections** — added in Run 10 but **unverified** due to LR
