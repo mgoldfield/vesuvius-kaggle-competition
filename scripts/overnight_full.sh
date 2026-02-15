@@ -38,11 +38,11 @@ echo ""
 
 mkdir -p "$ROOT/checkpoints/models"
 
-$VENV/jupyter nbconvert \
+jupyter nbconvert \
     --to notebook \
     --execute \
     --ExecutePreprocessor.timeout=-1 \
-    --ExecutePreprocessor.kernel_name=python3 \
+    --ExecutePreprocessor.kernel_name=venv \
     --output vesuvius_train_refinement_executed.ipynb \
     "$ROOT/notebooks/refinement/vesuvius_train_refinement.ipynb"
 
@@ -54,11 +54,11 @@ echo ""
 echo "=== Phase 3: Train v12 (SegResNet, flat_cos, 50 epochs) ==="
 echo ""
 
-$VENV/jupyter nbconvert \
+jupyter nbconvert \
     --to notebook \
     --execute \
     --ExecutePreprocessor.timeout=-1 \
-    --ExecutePreprocessor.kernel_name=python3 \
+    --ExecutePreprocessor.kernel_name=venv \
     --output vesuvius_train_v12_executed.ipynb \
     "$ROOT/notebooks/vesuvius_train_v12.ipynb"
 
