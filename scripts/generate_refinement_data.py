@@ -5,13 +5,14 @@ Runs the main segmentation model (Gaussian SWI) on all training volumes
 and saves the raw probability maps. These become the refinement model's
 input, with GT labels as targets.
 
-Output: /data/refinement_data/probmaps/{volume_id}.npy (float16, 320^3)
+Output: {ROOT}/data/refinement_data/probmaps/{volume_id}.npy (float16, 320^3)
 
 Usage:
+    # With traced model (no MONAI needed):
     python scripts/generate_refinement_data.py \
-        --checkpoint checkpoints/models/best_segresnet_v9.pth
+        --traced kaggle/kaggle_weights_download/best_segresnet_v9_traced.pt --tta
 
-    # With TTA (7x slower but matches inference pipeline):
+    # With checkpoint (needs MONAI):
     python scripts/generate_refinement_data.py \
         --checkpoint checkpoints/models/best_segresnet_v9.pth --tta
 """
@@ -22,13 +23,12 @@ import pandas as pd
 import tifffile
 import torch
 from pathlib import Path
-from monai.networks.nets import SegResNet
 
 # ── Config ────────────────────────────────────────────────
-ROOT = Path("/home/mongomatt/Projects/vesuvius")
-TRAIN_IMG = ROOT / "train_images"
-TRAIN_LBL = ROOT / "train_labels"
-OUTPUT_DIR = Path("/data/refinement_data/probmaps")
+ROOT = Path("/workspace/vesuvius-kaggle-competition")
+TRAIN_IMG = ROOT / "data" / "train_images"
+TRAIN_LBL = ROOT / "data" / "train_labels"
+OUTPUT_DIR = ROOT / "data" / "refinement_data" / "probmaps"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 PATCH_SIZE = 160
@@ -36,8 +36,14 @@ STRIDE = 80
 
 
 # ── Model loading ─────────────────────────────────────────
-def load_model(checkpoint_path):
-    """Load SegResNet from a fastai checkpoint."""
+def load_model(checkpoint_path=None, traced_path=None):
+    """Load model from traced .pt (preferred) or fastai checkpoint."""
+    if traced_path:
+        model = torch.jit.load(traced_path, map_location=DEVICE)
+        model.eval()
+        return model
+
+    from monai.networks.nets import SegResNet
     model = SegResNet(
         spatial_dims=3, in_channels=1, out_channels=1,
         init_filters=16, blocks_down=[1, 2, 2, 4], blocks_up=[1, 1, 1],
@@ -116,17 +122,20 @@ def tta_logit(model, volume):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint", required=True, help="Path to model checkpoint")
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--checkpoint", help="Path to fastai model checkpoint (.pth)")
+    group.add_argument("--traced", help="Path to traced model (.pt)")
     parser.add_argument("--tta", action="store_true", help="Use 7-fold TTA (7x slower)")
     args = parser.parse_args()
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    print(f"Loading model from {args.checkpoint}")
-    model = load_model(args.checkpoint)
+    src = args.traced or args.checkpoint
+    print(f"Loading model from {src}")
+    model = load_model(checkpoint_path=args.checkpoint, traced_path=args.traced)
 
     # Get all training volume IDs that have files on disk
-    train_df = pd.read_csv(ROOT / "train.csv")
+    train_df = pd.read_csv(ROOT / "data" / "train.csv")
     available_ids = set(int(p.stem) for p in TRAIN_IMG.glob("*.tif"))
     vol_ids = sorted(train_df[train_df.id.isin(available_ids)].id.tolist())
 
