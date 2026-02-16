@@ -1,20 +1,26 @@
 """
-Trace SegResNetDSAttn model(s) for Kaggle submission.
+Trace SegResNet model(s) for Kaggle submission.
 Traced models load with just torch.jit.load — no MONAI dependency needed.
 
-Usage:
-  # Trace a single model (v10):
-  python scripts/trace_model.py --checkpoint checkpoints/models/best_segresnet_v10.pth \
-                                --output kaggle/kaggle_weights/best_segresnet_v10_traced.pt
+Supports:
+  - Plain SegResNet (v9, v12): out_channels=1
+  - 3-class SegResNet (v13): out_channels=3
+  - SegResNetDSAttn (v10, v11): out_channels=1, attention gates + deep supervision
 
-  # Trace all 3 fold models (v11):
-  python scripts/trace_model.py \
-    --checkpoint checkpoints/models/best_segresnet_v11_fold0.pth \
-                 checkpoints/models/best_segresnet_v11_fold1.pth \
-                 checkpoints/models/best_segresnet_v11_fold2.pth \
-    --output kaggle/kaggle_weights/best_segresnet_v11_fold0_traced.pt \
-             kaggle/kaggle_weights/best_segresnet_v11_fold1_traced.pt \
-             kaggle/kaggle_weights/best_segresnet_v11_fold2_traced.pt
+Usage:
+  # Trace v12 (plain SegResNet):
+  python scripts/trace_model.py --checkpoint checkpoints/models/best_segresnet_v12.pth \
+                                --output kaggle/kaggle_weights/best_segresnet_v12_traced.pt
+
+  # Trace v13 (3-class):
+  python scripts/trace_model.py --checkpoint checkpoints/models/best_segresnet_v13.pth \
+                                --output kaggle/kaggle_weights/best_segresnet_v13_traced.pt \
+                                --out-channels 3
+
+  # Trace v10 (attention gates + deep supervision):
+  python scripts/trace_model.py --checkpoint checkpoints/models/best_segresnet_v10.pth \
+                                --output kaggle/kaggle_weights/best_segresnet_v10_traced.pt \
+                                --model-type dsattn
 """
 import argparse
 import torch
@@ -82,15 +88,21 @@ class SegResNetDSAttn(SegResNet):
             return self.decode(x, down_x)
 
 
-def create_model():
-    return SegResNetDSAttn(
-        spatial_dims=3, in_channels=1, out_channels=1, init_filters=16,
-        blocks_down=[1, 2, 2, 4], blocks_up=[1, 1, 1], dropout_prob=0.2,
-    )
+def create_model(model_type="plain", out_channels=1):
+    if model_type == "dsattn":
+        return SegResNetDSAttn(
+            spatial_dims=3, in_channels=1, out_channels=out_channels, init_filters=16,
+            blocks_down=[1, 2, 2, 4], blocks_up=[1, 1, 1], dropout_prob=0.2,
+        )
+    else:
+        return SegResNet(
+            spatial_dims=3, in_channels=1, out_channels=out_channels, init_filters=16,
+            blocks_down=[1, 2, 2, 4], blocks_up=[1, 1, 1], dropout_prob=0.2,
+        )
 
 
-def trace_checkpoint(ckpt_path, output_path, device="cpu"):
-    model = create_model()
+def trace_checkpoint(ckpt_path, output_path, model_type="plain", out_channels=1, device="cpu"):
+    model = create_model(model_type, out_channels)
 
     state = torch.load(ckpt_path, map_location=device, weights_only=False)
     if "model" in state:
@@ -105,18 +117,22 @@ def trace_checkpoint(ckpt_path, output_path, device="cpu"):
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     traced.save(str(output_path))
     size_mb = Path(output_path).stat().st_size / 1e6
-    print(f"  Traced: {ckpt_path} -> {output_path} ({size_mb:.1f} MB)")
+    print(f"  Traced: {ckpt_path} -> {output_path} ({size_mb:.1f} MB, {out_channels}ch)")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", nargs="+", required=True)
     parser.add_argument("--output", nargs="+", required=True)
+    parser.add_argument("--model-type", default="plain", choices=["plain", "dsattn"],
+                        help="Model architecture (plain=SegResNet, dsattn=SegResNetDSAttn)")
+    parser.add_argument("--out-channels", type=int, default=1,
+                        help="Number of output channels (1=binary, 3=3-class)")
     args = parser.parse_args()
 
     assert len(args.checkpoint) == len(args.output), "Must have same number of checkpoints and outputs"
 
     for ckpt, out in zip(args.checkpoint, args.output):
-        trace_checkpoint(ckpt, out)
+        trace_checkpoint(ckpt, out, args.model_type, args.out_channels)
 
     print(f"\nDone: {len(args.checkpoint)} model(s) traced.")

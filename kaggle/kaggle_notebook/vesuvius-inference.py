@@ -69,7 +69,8 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 PATCH_SIZE = 160
 STRIDE = 80
 T_LOW = 0.35
-T_HIGH = 0.80
+T_HIGH_FIXED = 0.75  # fallback if adaptive fails
+USE_ADAPTIVE_THRESHOLD = True  # per-volume adaptive T_HIGH
 CLOSING_Z_RADIUS = 2
 CLOSING_XY_RADIUS = 1
 DUST_MIN_SIZE = 100
@@ -80,7 +81,7 @@ print(f"Device: {DEVICE}")
 if torch.cuda.is_available():
     print(f"GPU: {torch.cuda.get_device_name(0)}")
 print(f"Patch size: {PATCH_SIZE}^3, Stride: {STRIDE}")
-print(f"Hysteresis: T_low={T_LOW}, T_high={T_HIGH}")
+print(f"Hysteresis: T_low={T_LOW}, T_high={'adaptive (p95>0.3)' if USE_ADAPTIVE_THRESHOLD else T_HIGH_FIXED}")
 print(f"TTA: {'ON (7-fold)' if USE_TTA else 'OFF'}")
 print(f"Surface splitting: {'ON' if USE_SURFACE_SPLIT and HAS_SURFACE_SPLITTER else 'OFF'}")
 
@@ -197,6 +198,20 @@ def sliding_window_inference_tta(model, volume, patch_size=160, stride=80, devic
     # Average logits, then apply sigmoid
     mean_logits = logits_sum / 7.0
     return 1.0 / (1.0 + np.exp(-mean_logits))  # sigmoid
+
+
+# ── Adaptive T_HIGH threshold ─────────────────────────────
+def adaptive_t_high(prob, min_prob=0.3, percentile=95):
+    """
+    Per-volume adaptive T_HIGH = 95th percentile of probabilities above min_prob.
+    Prevents catastrophic failure when a volume's max prob is below a fixed threshold.
+    Clamped to [0.50, 0.90] for safety.
+    """
+    high_probs = prob[prob > min_prob].astype(np.float32)
+    if len(high_probs) > 0:
+        t_high = float(np.percentile(high_probs, percentile))
+        return np.clip(t_high, 0.50, 0.90)
+    return 0.50
 
 
 # ── Hysteresis thresholding ────────────────────────────────
@@ -390,7 +405,8 @@ for i, row in test_df.iterrows():
     t0 = time.time()
     img = read_tiff_volume(img_path)
     prob = infer_fn(model, img, patch_size=PATCH_SIZE, stride=STRIDE, device=DEVICE)
-    pred = postprocess(prob, t_low=T_LOW, t_high=T_HIGH,
+    t_high = adaptive_t_high(prob) if USE_ADAPTIVE_THRESHOLD else T_HIGH_FIXED
+    pred = postprocess(prob, t_low=T_LOW, t_high=t_high,
                        z_radius=CLOSING_Z_RADIUS, xy_radius=CLOSING_XY_RADIUS,
                        min_size=DUST_MIN_SIZE)
 
@@ -401,7 +417,7 @@ for i, row in test_df.iterrows():
     write_tiff_volume(out_path, pred)
     fg = pred.sum()
     elapsed = time.time() - t0
-    print(f"fg={fg}/{pred.size} ({fg/pred.size*100:.1f}%) [{elapsed:.1f}s]")
+    print(f"T_high={t_high:.3f} fg={fg}/{pred.size} ({fg/pred.size*100:.1f}%) [{elapsed:.1f}s]")
 
 print("\nInference complete.")
 

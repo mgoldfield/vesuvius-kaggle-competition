@@ -7,9 +7,10 @@ for active decision-making — keep this file lean.
 ## Competition
 - **Goal:** Detect papyrus surfaces in 3D CT scans of Herculaneum scrolls
 - **Metric:** `0.30*TopoScore + 0.35*SurfaceDice@tau=2 + 0.35*VOI_score`
-- **Deadline:** Feb 27, 2026 (12 days remaining)
+- **Deadline:** Feb 27, 2026 (11 days remaining)
 - **Submission:** Code competition — Kaggle notebook, GPU, ≤9hr, no internet
-- **Leaderboard:** 1,334 teams. Top score 0.607. Our best public: 0.441 (but v15 pending)
+- **Leaderboard:** 1,334 teams. Top score 0.607. Our best public: 0.423 (v8)
+- **Public test: only 1 volume** (ID 1407735). Scores are high-variance/unreliable.
 
 ## Data
 - 786 training volumes, 320^3 uint8. Labels: 0=bg, 1=fg (sparse ~2-8%), 2=unlabeled (ignore)
@@ -37,7 +38,7 @@ for active decision-making — keep this file lean.
 | Run 3 | — | 0.348 | SuPreM SegResNet + clDice |
 | Run 8 | 0.562 | 0.423 | + FG sampling + TTA (LR too high, peaked epoch 1) |
 | Run 9 | 0.570 | 0.200 | **Best model** — v13 had wrong thresholds on Kaggle |
-| Run 9 | 0.570 | PENDING | v15: fixed thresholds, fg=28.0% |
+| Run 9 | 0.570 | 0.398 | v15: fixed thresholds — public test is 1 volume |
 | Run 10 | 0.584 | 0.267 | + attn gates + DS — peaked epoch 0 (LR issue) |
 | Run 12 | — | — | TRAINING: flat_cos + 50 epochs |
 
@@ -49,49 +50,82 @@ for active decision-making — keep this file lean.
 3. **fit_one_cycle warmup hurts pretrained models.** Destabilizes SuPreM features. Use
    `fit_flat_cos` (no warmup). LR magnitudes are right; schedule was the problem.
 4. **Dice and comp_score are uncorrelated.** Don't use dice for model selection.
-5. **T_high=0.80 beats 0.85** across all T_low values. Best: T_low=0.35, T_high=0.80.
+5. **T_high=0.75 is optimal.** 0.80 fails on scroll 35360 (max prob ~0.79 → zero seeds).
+   0.75 fixes 35360 (+0.223) with zero regression on other scrolls. Overall +0.043.
 6. **Early comp_score peaks are noise.** v9 peaked at epoch 8/30, v10 at epoch 0. Save by
    comp_score only from the second half of training (DelayedSaveCallback, epoch 25+).
 7. **Model selection is broken.** Training uses simplified inference; full pipeline gives 2x
    better scores. Solution: periodic checkpoints + post-training eval sweep.
+8. **Public leaderboard is unreliable.** Only 1 test volume — scores are high-variance.
+   v8 (0.423) vs v15 (0.398) is noise, not signal. Trust local validation over public score.
+9. **Local validation needs cross-scroll evaluation.** Validating on 5 volumes from 1 scroll
+   risks overfitting to that scroll's characteristics. Run `scripts/eval_cross_scroll.py` on
+   all 786 probmaps grouped by scroll_id to check generalization.
+10. **Adaptive T_HIGH has no benefit over fixed 0.75.** Tested 8 strategies (max*0.95, max-0.05,
+    p90/p95/p99 percentile). All score identically at 0.5737. What matters is binary: T_HIGH
+    below max prob → good; above → catastrophic. Fixed 0.75 is simplest and most robust.
 
-## Current Plan (overnight Feb 15 → afternoon Feb 16)
+## Current Status (Feb 16 night)
 
-**Overnight pipeline running** (`scripts/overnight_full.sh`), log: `logs/overnight_full.log`:
+**Overnight plan (Feb 16–17):**
+- **GPU 1 (local):** v12 training → checkpoint sweep → log results
+- **GPU 2 (remote):** v13 training → checkpoint sweep → log results
+- **GPU 3 (new):** Refinement Phase 3 (+ TV loss) → eval vs baseline → log results
+- **Kaggle v17:** Submitted, check score tomorrow
+- All results logged automatically; review at 1pm ET Feb 17
 
-1. **Phase 1: Generate probmaps** (~3hr) — Gaussian SWI + logit TTA on 786 volumes with v9.
-   Output: `data/refinement_data/probmaps/`
-2. **Phase 2: Train refinement model** (~2-3hr) — RefinementUNet3D (~365K params).
-   Phase 1: 50 epochs BCE+Dice (save by valid_loss). Phase 2: 30 epochs + topo losses (save by comp_score).
-   Head-to-head eval vs hand-tuned post-processing built into notebook.
-3. **Phase 3: Train v12** (~5-6hr) — Plain SegResNet, `fit_flat_cos`, 50 epochs, LR=1e-5.
-   DelayedSaveCallback (epoch 25+). Periodic checkpoints every 5 epochs. Auto-traces at end.
+**Tomorrow (Feb 17 afternoon):**
+- Review v12, v13, and refinement Phase 3 results
+- If v12 or v13 beats v9 → generate probmaps from winner → retrain refinement on those
+- If refinement Phase 3 improved → also try Option A (baseline post-processing after refinement)
+- Begin planning CV ensemble timing (target: end of week)
 
-**When you return:** check `logs/overnight_full.log`. Compare v12 vs v9 (0.570). Check
-refinement head-to-head. Best case: use v12 + refinement together.
+**SSH to GPU 2:** `ssh root@103.196.86.229 -p 13849 -i /root/.ssh/remote-gpu`
 
 ## Refinement Model
-- **Architecture:** RefinementUNet3D — shallow 3D U-Net, ~365K params, channels [8,16,32,64]
-- **Input:** v9 probability map (float16, 320^3). **Output:** refined logits.
-- **Phase 1:** fit_one_cycle, LR=1e-3, 50 epochs, BCE+Dice, save by valid_loss
-- **Phase 2:** fit_flat_cos, LR=3.3e-4, 30 epochs, BCE+Dice+clDice+Boundary, save by comp_score
-- **Kaggle:** torch.jit.trace → ~1.5 MB. Pipeline: main model → SWI+TTA → refinement → threshold 0.5
-- **Notebook:** `notebooks/refinement/vesuvius_train_refinement.ipynb`
+- **Phase 2 result:** Loses to baseline by -0.0298 (2W/18L on 20 val volumes).
+  Improves TopoScore (+0.015) and SurfaceDice (+0.033) but badly degrades VOI (-0.131).
+- **Diagnosis:** VOI degradation is expected — no smoothness objective in loss function.
+  The model optimized what it was trained on (topo via clDice, sdice via Boundary) and
+  produced fragmented outputs that hurt VOI.
+- **Phase 3 plan:** Fine-tune from Phase 2 weights with TV (Total Variation) loss added.
+  TV penalizes spatial discontinuity → directly fights fragmentation that kills VOI.
+  Loss = BCE + Dice + clDice + Boundary + TV (modest weight 0.1-0.2).
+- **Future:** If v12/v13 beats v9, retrain refinement on those probmaps instead of v9's.
+- **Option A (untested):** Apply baseline post-processing (hysteresis + closing + dust removal)
+  *after* refinement model output. Zero cost, may recover VOI without retraining. Test tomorrow.
+- **Eval:** `scripts/eval_refinement.py`, results in `logs/refinement_eval.csv`
+
+## Strategy
+- **Differentiation:** Avoid nnUNet (black box, everyone uses it). Custom refinement model
+  is our edge — a learned post-processing step that others aren't doing.
+- **CV ensemble:** Plan for end of week (~Feb 21-22). Reliable +2-5% but freezes iteration.
+  Need best base model finalized first.
+- **Iteration order:** base model (v12/v13) → refinement on best probmaps → ensemble last
 
 ## Improvement Roadmap
 
-### Ready to try next
-- [ ] **Post-training eval sweep** — run full pipeline on all periodic v12 checkpoints
-- [ ] **3-class formulation** — predict bg/fg/unlabeled as 3 classes. All top notebooks use this.
-- [ ] **CV ensemble** — 3-fold scroll-grouped CV with probability averaging. Needs reliable
-  base model first (v12 or v9).
-- [ ] **nnUNet framework** — self-configuring, often wins competitions. Pre-processed data exists.
+### Done
+- [x] **Cross-scroll evaluation** — Scroll 35360 catastrophic failure → fixed with T_HIGH=0.75.
+- [x] **Adaptive thresholds** — No benefit over fixed 0.75 (8 strategies, all equal).
+- [x] **Refinement Phase 1-2** — Proof of concept. Improves topo+sdice, needs VOI fix.
 
-### Proven but unverified at scale
-- [ ] **Attention gates + deep supervision** — added in v10/v10b but LR issues prevented proper
-  testing. Could revisit with flat_cos + per-module LRs if base model improves.
-- [ ] **Skeleton recall loss** — pre-compute GT skeleton, penalize missed voxels.
-- [ ] **3D CutOut augmentation** — zero out random cuboids. Strong regularizer.
+### In progress
+- [~] **v12 (flat_cos retraining)** — Training on local GPU. flat_cos, 50 epochs, periodic checkpoints.
+- [~] **v13 (3-class formulation)** — Training on remote GPU. 3-class CE + Dice/clDice/Boundary.
+- [~] **Refinement Phase 3 (TV loss)** — Writing notebook, will train on 3rd GPU tonight.
+
+### Next up
+- [ ] **Post-training eval sweep** — Script ready (`scripts/eval_checkpoint_sweep.py`).
+  Run on v12/v13 checkpoints when training completes.
+- [ ] **Generate probmaps from best model** — If v12/v13 beats v9, generate new probmaps
+  for refinement training. ~3 hours without TTA.
+- [ ] **CV ensemble** — Target end of week. 3-fold scroll-grouped CV, average probabilities.
+
+### Ideas on deck
+- [ ] **Attention gates + deep supervision** — Revisit with flat_cos if base model improves.
+- [ ] **Skeleton recall loss** — Pre-compute GT skeleton, penalize missed voxels.
+- [ ] **3D CutOut augmentation** — Zero out random cuboids. Strong regularizer.
 
 ## Kaggle Submission Quick Reference
 ```bash
@@ -113,14 +147,17 @@ tokens: `rm /tmp/.kaggle/uploads/*.json`. Use `--dir-mode zip` for subdirectorie
 |---------|---------|------|--------|-------|
 | v13 | v9 traced | Feb 12 | 0.200 | Wrong thresholds → 0% fg |
 | v14 | v9 traced | Feb 12 | COMPLETE | No public score shown |
-| v15 | v9 traced | Feb 15 | PENDING | Fixed: T_low=0.35, T_high=0.80, no splitting → fg=28.0% |
+| v15 | v9 traced | Feb 15 | 0.398 | Fixed thresholds. Public test = 1 volume (high variance) |
+| v16 | v9 traced | Feb 16 | PENDING | T_HIGH=0.75 (cross-scroll fix for scroll 35360) |
+| v17 | v9 traced | Feb 16 | PENDING | Adaptive T_HIGH (p95 of probs > 0.3, clamped 0.50-0.90) |
 
 ## File Structure
 ```
 /workspace/vesuvius-kaggle-competition/
-├── notebooks/                     # Training notebooks (v1-v12 + refinement)
+├── notebooks/                     # Training notebooks (v1-v13 + refinement)
 │   ├── vesuvius_train_v9.ipynb    #   Current best model
-│   ├── vesuvius_train_v12.ipynb   #   flat_cos retraining (running)
+│   ├── vesuvius_train_v12.ipynb   #   flat_cos retraining (queued)
+│   ├── vesuvius_train_v13.ipynb   #   3-class formulation (ready to train)
 │   └── refinement/                #   Learned post-processing
 ├── data/                          # Competition data (not in git)
 │   ├── train_images/              #   786 .tif volumes
@@ -135,7 +172,10 @@ tokens: `rm /tmp/.kaggle/uploads/*.json`. Use `--dir-mode zip` for subdirectorie
 │   ├── overnight_refinement.sh    #   Refinement-only pipeline
 │   ├── generate_refinement_data.py
 │   ├── eval_inference.py          #   Compare inference pipelines
-│   ├── trace_model.py             #   Trace models for Kaggle
+│   ├── eval_cross_scroll.py       #   Cross-scroll generalization analysis
+│   ├── eval_checkpoint_sweep.py   #   Post-training checkpoint evaluation
+│   ├── eval_refinement.py         #   Refinement vs baseline head-to-head
+│   ├── trace_model.py             #   Trace models for Kaggle (plain/dsattn/3-class)
 │   └── smoke_test.py              #   Pre-flight check for notebooks
 ├── checkpoints/                   # Model weights (not in git)
 ├── pretrained_weights/            # SuPreM weights (not in git)
