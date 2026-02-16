@@ -81,6 +81,8 @@ for active decision-making — keep this file lean.
 - Begin planning CV ensemble timing (target: end of week)
 
 **SSH to GPU 2:** `ssh root@103.196.86.229 -p 13849 -i /root/.ssh/remote-gpu`
+**SSH to GPU 3:** `ssh root@103.196.86.227 -p 13963 -i /root/.ssh/remote-gpu`
+All 3 GPUs are RTX 5090 (32GB). Key at `/root/.ssh/remote-gpu` (copied from `/workspace/remote-gpu`).
 
 ## Refinement Model
 - **Phase 2 result:** Loses to baseline by -0.0298 (2W/18L on 20 val volumes).

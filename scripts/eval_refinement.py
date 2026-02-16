@@ -146,14 +146,19 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--n-volumes", type=int, default=20,
                         help="Number of val volumes to evaluate")
-    parser.add_argument("--phase", type=int, default=2, choices=[1, 2],
+    parser.add_argument("--phase", type=int, default=2, choices=[1, 2, 3],
                         help="Which refinement phase checkpoint to load")
+    parser.add_argument("--checkpoint", type=str, default=None,
+                        help="Path to specific checkpoint (overrides --phase)")
     parser.add_argument("--device", default="cuda",
                         help="Device for refinement model")
     args = parser.parse_args()
 
     # Load refinement model
-    ckpt_path = ROOT / "checkpoints" / "models" / f"best_refinement_phase{args.phase}.pth"
+    if args.checkpoint:
+        ckpt_path = Path(args.checkpoint)
+    else:
+        ckpt_path = ROOT / "checkpoints" / "models" / f"best_refinement_phase{args.phase}.pth"
     print(f"Loading refinement model: {ckpt_path}")
     model = RefinementUNet3D()
     state_dict = torch.load(ckpt_path, map_location="cpu", weights_only=False)
