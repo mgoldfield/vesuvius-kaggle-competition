@@ -75,7 +75,10 @@ for active decision-making — keep this file lean.
 - All results logged automatically; review at 1pm ET Feb 17
 
 **Tomorrow (Feb 17 afternoon):**
-- Review v12, v13, and refinement Phase 3 results
+- Review overnight queue results: `cat logs/overnight_gpu1_queue.log`
+- Review Phase 3 results from GPU 3: `cat logs/refinement_phase3_training.log`
+- Check Kaggle v17 score: `kaggle competitions submissions -c vesuvius-challenge-surface-detection`
+- **Read visualization notebook:** `notebooks/analysis/visualize_model_comparison.ipynb` — cross-sections, TP/FP/FN overlays, prob distributions, fragmentation analysis, refinement before/after
 - If v12 or v13 beats v9 → generate probmaps from winner → retrain refinement on those
 - If refinement Phase 3 improved → also try Option A (baseline post-processing after refinement)
 - Begin planning CV ensemble timing (target: end of week)

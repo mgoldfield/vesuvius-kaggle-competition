@@ -129,6 +129,15 @@ def postprocess_refinement(prob, model, device):
     return pred
 
 
+def postprocess_refinement_then_baseline(prob, model, device):
+    """Option A: probmap → model → sigmoid → baseline post-processing."""
+    with torch.no_grad():
+        inp = torch.from_numpy(prob.astype(np.float32)).unsqueeze(0).unsqueeze(0).to(device)
+        logits = model(inp)
+        refined_prob = torch.sigmoid(logits).squeeze().cpu().numpy()
+    return postprocess_baseline(refined_prob)
+
+
 # ── Scoring ───────────────────────────────────────────────────
 
 def score(pred, lbl, ds=METRIC_DOWNSAMPLE):
@@ -190,33 +199,45 @@ def main():
         pred_base = postprocess_baseline(prob)
         t_base = time.time() - t0
 
-        # Refinement
+        # Refinement (raw threshold)
         t0 = time.time()
         pred_ref = postprocess_refinement(prob, model, device)
         t_ref = time.time() - t0
 
-        # Score both
+        # Refinement + baseline post-processing (Option A)
+        t0 = time.time()
+        pred_ref_pp = postprocess_refinement_then_baseline(prob, model, device)
+        t_ref_pp = time.time() - t0
+
+        # Score all three
         report_base = score(pred_base, lbl)
         report_ref = score(pred_ref, lbl)
+        report_ref_pp = score(pred_ref_pp, lbl)
 
         delta = report_ref.score - report_base.score
+        delta_pp = report_ref_pp.score - report_base.score
         results.append({
             "vol_id": vid,
             "baseline": report_base.score,
             "refined": report_ref.score,
+            "refined_pp": report_ref_pp.score,
             "delta": delta,
+            "delta_pp": delta_pp,
             "base_topo": report_base.topo.toposcore,
             "ref_topo": report_ref.topo.toposcore,
+            "ref_pp_topo": report_ref_pp.topo.toposcore,
             "base_sdice": report_base.surface_dice,
             "ref_sdice": report_ref.surface_dice,
+            "ref_pp_sdice": report_ref_pp.surface_dice,
             "base_voi": report_base.voi.voi_score,
             "ref_voi": report_ref.voi.voi_score,
+            "ref_pp_voi": report_ref_pp.voi.voi_score,
         })
-        marker = "+" if delta > 0 else "-" if delta < 0 else "="
+        m1 = "+" if delta > 0 else "-" if delta < 0 else "="
+        m2 = "+" if delta_pp > 0 else "-" if delta_pp < 0 else "="
         print(f"  [{i+1}/{len(eval_ids)}] {vid}: "
-              f"baseline={report_base.score:.4f} refined={report_ref.score:.4f} "
-              f"delta={delta:+.4f} [{marker}] "
-              f"(base:{t_base:.1f}s ref:{t_ref:.1f}s)")
+              f"base={report_base.score:.4f} ref={report_ref.score:.4f}({m1}) "
+              f"ref+pp={report_ref_pp.score:.4f}({m2})")
 
     elapsed = time.time() - t_start
     df = pd.DataFrame(results)
@@ -224,24 +245,24 @@ def main():
     print(f"\n{'='*70}")
     print(f"HEAD-TO-HEAD RESULTS ({len(eval_ids)} val volumes, {elapsed:.0f}s total)")
     print(f"{'='*70}")
-    print(f"  Baseline (hand-tuned):  {df.baseline.mean():.4f} mean comp_score")
-    print(f"  Refinement (phase {args.phase}):  {df.refined.mean():.4f} mean comp_score")
-    print(f"  Delta:                  {df.delta.mean():+.4f}")
-    print(f"  Wins: {(df.delta > 0).sum()}, Losses: {(df.delta < 0).sum()}, "
-          f"Ties: {(df.delta == 0).sum()}")
+    print(f"  Baseline (hand-tuned):     {df.baseline.mean():.4f} mean comp_score")
+    print(f"  Refinement (phase {args.phase}):     {df.refined.mean():.4f} mean comp_score  "
+          f"delta={df.delta.mean():+.4f}  W/L={(df.delta > 0).sum()}/{(df.delta < 0).sum()}")
+    print(f"  Refinement + postproc (A): {df.refined_pp.mean():.4f} mean comp_score  "
+          f"delta={df.delta_pp.mean():+.4f}  W/L={(df.delta_pp > 0).sum()}/{(df.delta_pp < 0).sum()}")
 
     print(f"\n  Component breakdown (mean):")
-    print(f"    TopoScore:    baseline={df.base_topo.mean():.4f}  refined={df.ref_topo.mean():.4f}  "
-          f"delta={df.ref_topo.mean()-df.base_topo.mean():+.4f}")
-    print(f"    SurfaceDice:  baseline={df.base_sdice.mean():.4f}  refined={df.ref_sdice.mean():.4f}  "
-          f"delta={df.ref_sdice.mean()-df.base_sdice.mean():+.4f}")
-    print(f"    VOI:          baseline={df.base_voi.mean():.4f}  refined={df.ref_voi.mean():.4f}  "
-          f"delta={df.ref_voi.mean()-df.base_voi.mean():+.4f}")
+    print(f"    {'':20s} {'Baseline':>10s} {'Refined':>10s} {'Ref+PP':>10s}")
+    print(f"    {'TopoScore':20s} {df.base_topo.mean():10.4f} {df.ref_topo.mean():10.4f} {df.ref_pp_topo.mean():10.4f}")
+    print(f"    {'SurfaceDice':20s} {df.base_sdice.mean():10.4f} {df.ref_sdice.mean():10.4f} {df.ref_pp_sdice.mean():10.4f}")
+    print(f"    {'VOI':20s} {df.base_voi.mean():10.4f} {df.ref_voi.mean():10.4f} {df.ref_pp_voi.mean():10.4f}")
 
-    if df.delta.mean() > 0:
-        print(f"\n>>> PASS: Refinement model beats baseline by {df.delta.mean():+.4f} <<<")
+    best_method = "Refinement+PP" if df.delta_pp.mean() > df.delta.mean() else "Refinement"
+    best_delta = max(df.delta.mean(), df.delta_pp.mean())
+    if best_delta > 0:
+        print(f"\n>>> PASS: {best_method} beats baseline by {best_delta:+.4f} <<<")
     else:
-        print(f"\n>>> FAIL: Baseline wins by {-df.delta.mean():.4f} <<<")
+        print(f"\n>>> FAIL: Baseline wins (best delta: {best_delta:+.4f}) <<<")
 
     # Save detailed results
     out = ROOT / "logs" / "refinement_eval.csv"
