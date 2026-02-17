@@ -65,48 +65,83 @@ for active decision-making — keep this file lean.
     p90/p95/p99 percentile). All score identically at 0.5737. What matters is binary: T_HIGH
     below max prob → good; above → catastrophic. Fixed 0.75 is simplest and most robust.
 
-## Current Status (Feb 16 night)
+## Current Status (Feb 17 evening)
 
-**Overnight plan (Feb 16–17):**
-- **GPU 1 (local):** v12 training → checkpoint sweep → log results
-- **GPU 2 (remote):** v13 training → checkpoint sweep → log results
-- **GPU 3 (new):** Refinement Phase 3 (+ TV loss) → eval vs baseline → log results
-- **Kaggle v17:** Submitted, check score tomorrow
-- All results logged automatically; review at 1pm ET Feb 17
+### STRATEGIC PIVOT: Adopting TransUNet + medicai framework
 
-**Tomorrow (Feb 17 afternoon):**
-- Review overnight queue results: `cat logs/overnight_gpu1_queue.log`
-- Review Phase 3 results from GPU 3: `cat logs/refinement_phase3_training.log`
-- Check Kaggle v17 score: `kaggle competitions submissions -c vesuvius-challenge-surface-detection`
-- **Read visualization notebook:** `notebooks/analysis/visualize_model_comparison.ipynb` — cross-sections, TP/FP/FN overlays, prob distributions, fragmentation analysis, refinement before/after
-- If v12 or v13 beats v9 → generate probmaps from winner → retrain refinement on those
-- If refinement Phase 3 improved → also try Option A (baseline post-processing after refinement)
-- Begin planning CV ensemble timing (target: end of week)
+After competitor analysis revealed that ALL top teams use TransUNet + SEResNeXt50 (70.1M params
+vs our 4.7M SegResNet), we are abandoning our SegResNet approach and adopting the competitor
+framework directly. The pretrained TransUNet weights already achieve 0.545 LB — we just need
+to fine-tune and apply our post-processing improvements.
 
-**SSH to GPU 2:** `ssh root@103.196.86.229 -p 13849 -i /root/.ssh/remote-gpu`
-**SSH to GPU 3:** `ssh root@103.196.86.227 -p 13963 -i /root/.ssh/remote-gpu`
-All 3 GPUs are RTX 5090 (32GB). Key at `/root/.ssh/remote-gpu` (copied from `/workspace/remote-gpu`).
+**TransUNet setup (COMPLETED):**
+- Installed Keras 3 + medicai (from GitHub source — pip version is WRONG)
+- Downloaded 3 pretrained weight sets from Kaggle (see `TRANSUNET_SETUP.md`)
+- Verified: model loads, forward pass works, produces correct (1,160,160,160,3) output
+- Memory test: peak 19.89 GB for bs=1 training on 160^3. Safe on RTX 5090 (33.7 GB).
+- Using `KERAS_BACKEND=torch` locally for PyTorch backend
 
-## Refinement Model
-- **Phase 2 result:** Loses to baseline by -0.0298 (2W/18L on 20 val volumes).
-  Improves TopoScore (+0.015) and SurfaceDice (+0.033) but badly degrades VOI (-0.131).
-- **Diagnosis:** VOI degradation is expected — no smoothness objective in loss function.
-  The model optimized what it was trained on (topo via clDice, sdice via Boundary) and
-  produced fragmented outputs that hurt VOI.
-- **Phase 3 plan:** Fine-tune from Phase 2 weights with TV (Total Variation) loss added.
-  TV penalizes spatial discontinuity → directly fights fragmentation that kills VOI.
-  Loss = BCE + Dice + clDice + Boundary + TV (modest weight 0.1-0.2).
-- **Future:** If v12/v13 beats v9, retrain refinement on those probmaps instead of v9's.
-- **Option A (untested):** Apply baseline post-processing (hysteresis + closing + dust removal)
-  *after* refinement model output. Zero cost, may recover VOI without retraining. Test tomorrow.
-- **Eval:** `scripts/eval_refinement.py`, results in `logs/refinement_eval.csv`
+**Refinement approach: ABANDONED** (GPU 3 shut down by user)
 
-## Strategy
-- **Differentiation:** Avoid nnUNet (black box, everyone uses it). Custom refinement model
-  is our edge — a learned post-processing step that others aren't doing.
-- **CV ensemble:** Plan for end of week (~Feb 21-22). Reliable +2-5% but freezes iteration.
-  Need best base model finalized first.
-- **Iteration order:** base model (v12/v13) → refinement on best probmaps → ensemble last
+**Kaggle v17: 0.431** (best public score)
+
+### Key findings this session
+
+**METRIC_DOWNSAMPLE=4 inflates local scores by +0.16:**
+
+| Downsample | Mean CompScore (5 vol) | Difference |
+|-----------|----------------------|-----------|
+| **ds=1 (full res, what Kaggle uses)** | **0.4113** | — |
+| ds=2 | 0.5039 | +0.093 |
+| ds=4 (what we've been using) | 0.5700 | **+0.159** |
+
+Our "0.57 local val" is actually ~0.41 at full resolution. All future eval uses **ds=1**.
+
+**Competitor analysis:** See `COMPETITOR_ANALYSIS.md` for full 17-notebook breakdown.
+Top approach: TransUNet SEResNeXt50, 3-class, SparseDiceCE + SkeletonRecall + FP_Volume,
+dual-stream inference, seeded hysteresis. Pretrained model gets 0.545 LB out of the box.
+
+### TransUNet Fine-Tuning Memory Budget (RTX 5090, 33.7 GB)
+
+| Config | Peak VRAM | Status |
+|--------|-----------|--------|
+| bs=1, fp32, 160^3 | 19.89 GB | Safe (13.8 GB headroom) |
+| bs=2, fp32, 160^3 | ~33.8 GB | Likely OOM |
+| bs=1, fp16, 160^3 | ~10-12 GB (est.) | Safe, enables bs=2 |
+| Recommended | bs=1 + grad_accum=4 | Simulates bs=4, 19.89 GB |
+
+### What's next
+
+1. **Full-volume SWI inference** with TransUNet on validation set
+2. **Compare scores** to our SegResNet baseline (expect ~0.54 at ds=1 vs our 0.41)
+3. **Apply our post-processing** (hysteresis + closing + dust) to TransUNet output
+4. **Set up Kaggle submission** with TransUNet (use JAX backend on Kaggle)
+5. **Fine-tune** TransUNet with our training data + competitor loss functions
+
+**Hardware:** GPU 1 only (RTX 5090). GPU 2 paused. GPU 3 shut down.
+
+## Refinement Model (ABANDONED)
+- Approached abandoned in favor of TransUNet pivot. GPU 3 shut down.
+- Phase 2 result: delta -0.0298 vs baseline. Improves topo+sdice but destroys VOI.
+- If TransUNet fine-tuning leaves spare GPU time, could revisit refinement on top of
+  TransUNet probmaps. Low priority.
+
+## Strategy (REVISED Feb 17 evening)
+
+**Pivoting to TransUNet.** Our SegResNet (4.7M params) cannot compete with TransUNet
+(70.1M params). The pretrained TransUNet already scores 0.545 LB vs our 0.431. Rather
+than incremental improvements to a weak model, we adopt the winning framework directly.
+
+**Priority order (10 days remaining):**
+1. **TransUNet inference pipeline** — Run pretrained model on validation set, apply our
+   post-processing, measure full-res scores. Should immediately beat our SegResNet.
+2. **Kaggle submission with TransUNet** — Adapt inference notebook for Kaggle (JAX backend,
+   offline wheels). Target: match or beat public 0.545.
+3. **Fine-tune TransUNet** — Train with competitor loss (SparseDiceCE + SkeletonRecall +
+   FP_Volume) + our data augmentation. bs=1 with grad_accum=4 on RTX 5090.
+4. **Post-processing optimization** — Dual-stream inference, seeded hysteresis, surface
+   splitting (killer ant). These are additive on top of the better base model.
+5. **Ensemble** — Fine-tuned TransUNet + pretrained TransUNet (different weights).
 
 ## Improvement Roadmap
 
@@ -114,23 +149,28 @@ All 3 GPUs are RTX 5090 (32GB). Key at `/root/.ssh/remote-gpu` (copied from `/wo
 - [x] **Cross-scroll evaluation** — Scroll 35360 catastrophic failure → fixed with T_HIGH=0.75.
 - [x] **Adaptive thresholds** — No benefit over fixed 0.75 (8 strategies, all equal).
 - [x] **Refinement Phase 1-2** — Proof of concept. Improves topo+sdice, needs VOI fix.
+- [x] **Metric downsample investigation** — ds=4 inflates by +0.16. Use ds=1 going forward.
+- [x] **Competitor notebook analysis** — Downloaded 17 notebooks, identified key techniques.
+- [x] **TransUNet setup** — Installed medicai, loaded pretrained weights, verified inference.
 
 ### In progress
-- [~] **v12 (flat_cos retraining)** — Training on local GPU. flat_cos, 50 epochs, periodic checkpoints.
-- [~] **v13 (3-class formulation)** — Training on remote GPU. 3-class CE + Dice/clDice/Boundary.
-- [~] **Refinement Phase 3 (TV loss)** — Writing notebook, will train on 3rd GPU tonight.
+- [~] **TransUNet full-volume inference** — Set up SWI for validation set evaluation.
 
-### Next up
-- [ ] **Post-training eval sweep** — Script ready (`scripts/eval_checkpoint_sweep.py`).
-  Run on v12/v13 checkpoints when training completes.
-- [ ] **Generate probmaps from best model** — If v12/v13 beats v9, generate new probmaps
-  for refinement training. ~3 hours without TTA.
-- [ ] **CV ensemble** — Target end of week. 3-fold scroll-grouped CV, average probabilities.
+### Next up (PRIORITY ORDER)
+- [ ] **TransUNet val set evaluation** — Run pretrained TransUNet on 5+ val volumes at ds=1.
+  Compare to SegResNet baseline (expected: ~0.54 vs 0.41).
+- [ ] **Kaggle submission with TransUNet** — Adapt inference for Kaggle (JAX backend,
+  offline wheels, competitor post-processing params).
+- [ ] **Fine-tune TransUNet** — Train with SparseDiceCE + SkeletonRecall + FP_Volume.
+  bs=1, grad_accum=4, cosine decay from 5e-5. Checkpoint every epoch.
+- [ ] **Post-processing optimization** — Dual-stream inference, seeded hysteresis,
+  confidence-based CC filtering, surface splitting.
+- [ ] **Ensemble** — Average fine-tuned + pretrained TransUNet weights.
 
 ### Ideas on deck
-- [ ] **Attention gates + deep supervision** — Revisit with flat_cos if base model improves.
-- [ ] **Skeleton recall loss** — Pre-compute GT skeleton, penalize missed voxels.
-- [ ] **3D CutOut augmentation** — Zero out random cuboids. Strong regularizer.
+- [ ] **Surface splitting (killer ant)** — Port the post-processing from competitors.
+- [ ] **TV smoothing of probmaps** — `skimage.restoration.denoise_tv_chambolle` before thresholding.
+- [ ] **SegResNet ensemble member** — Our old model as diversity for ensemble (low priority).
 
 ## Kaggle Submission Quick Reference
 ```bash
@@ -160,34 +200,30 @@ tokens: `rm /tmp/.kaggle/uploads/*.json`. Use `--dir-mode zip` for subdirectorie
 ```
 /workspace/vesuvius-kaggle-competition/
 ├── notebooks/                     # Training notebooks (v1-v13 + refinement)
-│   ├── vesuvius_train_v9.ipynb    #   Current best model
-│   ├── vesuvius_train_v12.ipynb   #   flat_cos retraining (queued)
-│   ├── vesuvius_train_v13.ipynb   #   3-class formulation (ready to train)
-│   └── refinement/                #   Learned post-processing
+│   ├── vesuvius_train_v9.ipynb    #   Best SegResNet model
+│   ├── vesuvius_train_v12.ipynb   #   flat_cos retraining
+│   └── vesuvius_train_v13.ipynb   #   3-class formulation
 ├── data/                          # Competition data (not in git)
 │   ├── train_images/              #   786 .tif volumes
 │   ├── train_labels/              #   786 .tif labels
-│   ├── refinement_data/probmaps/  #   v9 probmaps for refinement (generating)
 │   └── train.csv, test.csv
+├── pretrained_weights/            # Model weights (not in git)
+│   ├── transunet/                 #   TransUNet SEResNeXt50 weights from Kaggle
+│   │   ├── transunet.seresnext50.160px.comboloss.weights.h5  (LB 0.545)
+│   │   ├── transunet.seresnext50.160px.weights.h5            (LB 0.505)
+│   │   └── transunet.seresnext50.128px.weights.h5            (LB 0.500)
+│   └── suprem/                    #   SuPreM weights (for SegResNet)
+├── competitor_notebooks/          # Downloaded competitor notebooks (17)
 ├── kaggle/                        # Submission artifacts
 │   ├── kaggle_notebook/           #   Inference script + kernel metadata
 │   └── kaggle_weights_download/   #   Traced models (v9, v10, v11, v12)
 ├── scripts/                       # Automation
-│   ├── overnight_full.sh          #   Current overnight pipeline
-│   ├── overnight_refinement.sh    #   Refinement-only pipeline
-│   ├── generate_refinement_data.py
-│   ├── eval_inference.py          #   Compare inference pipelines
-│   ├── eval_cross_scroll.py       #   Cross-scroll generalization analysis
-│   ├── eval_checkpoint_sweep.py   #   Post-training checkpoint evaluation
-│   ├── eval_refinement.py         #   Refinement vs baseline head-to-head
-│   ├── trace_model.py             #   Trace models for Kaggle (plain/dsattn/3-class)
-│   └── smoke_test.py              #   Pre-flight check for notebooks
-├── checkpoints/                   # Model weights (not in git)
-├── pretrained_weights/            # SuPreM weights (not in git)
 ├── libs/topological-metrics-kaggle/  # topometrics library
 ├── logs/                          # Pipeline logs
 ├── NOTES.md                       # This file (active)
 ├── HISTORY.md                     # Run history & blog source
 ├── INSTALLATION.md                # Dependency reinstall guide
+├── TRANSUNET_SETUP.md             # TransUNet installation guide
+├── COMPETITOR_ANALYSIS.md         # Competitor notebook analysis
 └── CLAUDE.md                      # Claude Code instructions
 ```
