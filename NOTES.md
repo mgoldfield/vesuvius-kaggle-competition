@@ -9,7 +9,7 @@ for active decision-making — keep this file lean.
 - **Metric:** `0.30*TopoScore + 0.35*SurfaceDice@tau=2 + 0.35*VOI_score`
 - **Deadline:** Feb 27, 2026 (11 days remaining)
 - **Submission:** Code competition — Kaggle notebook, GPU, ≤9hr, no internet
-- **Leaderboard:** 1,334 teams. Top score 0.607. Our best public: 0.423 (v8)
+- **Leaderboard:** 1,334 teams. Top score 0.607. Our best public: 0.504 (v20, TransUNet)
 - **Public test: only 1 volume** (ID 1407735). Scores are high-variance/unreliable.
 
 ## Data
@@ -41,6 +41,7 @@ for active decision-making — keep this file lean.
 | Run 9 | 0.570 | 0.398 | v15: fixed thresholds — public test is 1 volume |
 | Run 10 | 0.584 | 0.267 | + attn gates + DS — peaked epoch 0 (LR issue) |
 | Run 12 | — | — | TRAINING: flat_cos + 50 epochs |
+| TransUNet pretrained | 0.510 (82v) | **0.504** | Comboloss weights, dual-stream, 7-TTA |
 
 ## Key Insights (from 11 runs — details in HISTORY.md)
 1. **Inference pipeline > model architecture.** Gaussian SWI + logit TTA gave +0.19 comp_score
@@ -65,27 +66,96 @@ for active decision-making — keep this file lean.
     p90/p95/p99 percentile). All score identically at 0.5737. What matters is binary: T_HIGH
     below max prob → good; above → catastrophic. Fixed 0.75 is simplest and most robust.
 
-## Current Status (Feb 17 evening)
+## Current Status (Feb 17 overnight → Feb 18 morning)
 
-### STRATEGIC PIVOT: Adopting TransUNet + medicai framework
+### Kaggle TransUNet submission: v20 scored 0.504 (up from 0.431)
 
-After competitor analysis revealed that ALL top teams use TransUNet + SEResNeXt50 (70.1M params
-vs our 4.7M SegResNet), we are abandoning our SegResNet approach and adopting the competitor
-framework directly. The pretrained TransUNet weights already achieve 0.545 LB — we just need
-to fine-tune and apply our post-processing improvements.
+Built and pushed a TransUNet inference notebook based on Tony Li's 0.552 dual-stream
+approach. v18 failed (FileNotFoundError — model_sources path wrong). Fixed by uploading
+TransUNet weights to our own dataset (`mgoldfield/vesuvius-unet3d-weights`). v20 completed.
 
-**TransUNet setup (COMPLETED):**
+**Public LB: 0.504** — +17% over our previous best (0.431), but below the competitor's
+0.545 with same weights. Gap likely due to post-processing params (our sweep is showing
+tlow=0.6 > tlow=0.5 locally). Next submission should use optimized PP params.
+
+**Key features of v20 inference:**
+- JAX backend + Keras 3 + medicai offline wheels
+- Dual-stream inference (Tony Li's 0.552 approach):
+  - Public stream: overlap=0.42, softmax argmax → foreground anchor
+  - Private stream: overlap=0.43 (TTA) / 0.60 (identity), binary logits
+- 7-fold TTA (identity + 3 flips + 3 rotations)
+- Binary logit: `logsumexp(L1, L2) - L0` from 3-class
+- Seeded hysteresis: strong=(prob>=0.90), weak=(prob>=0.50 OR public_fg)
+- Anisotropic closing (z=3, xy=2) + dust removal (100 voxels)
+- Using comboloss weights (LB 0.545 as single-stream baseline)
+
+**Files:**
+- `kaggle/kaggle_notebook/vesuvius-inference.py` — inference script
+- `kaggle/kaggle_notebook/kernel-metadata.json` — kernel metadata
+
+### Overnight pipeline: Phase 5 (PP sweep) running
+
+Launched at 05:39. Phases 1-4 completed successfully. Phase 5 (PP sweep, 26 configs) in progress.
+
+**Phase 1 (Benchmark):** Completed. Single patch: 0.141s fwd, 0.443s fwd+bwd. Peak 19.82 GB.
+Full volume SWI (overlap=0.5): 6.2s. 10-epoch training: ~1 hour.
+
+**Phase 2 (Validation Inference):** Completed. 82 volumes, scroll 26002.
+Mean composite: 0.510 (all 82 vols, ds=1). Probmaps saved to `data/transunet_probmaps/`.
+
+**Phase 3 (TTA):** Completed. (Results in log — 5 volumes with TTA.)
+
+**Phase 4 (Cross-scroll):** Completed. 30 volumes across 6 scrolls.
+Mean composite: 0.544 (30 vols). Per-scroll: 26002=0.476, 26010=0.656, 34117=0.486,
+35360=0.507, 44430=0.518, 53997=0.508.
+
+**Phase 5 (PP Sweep):** COMPLETED. 26 configs on 82 full-res volumes. Results:
+```
+Config                      Comp   Topo  SDice    VOI
+tlow_0.6                  0.5179 0.2024 0.7342 0.5722  ← BEST (+0.0076)
+close_z2_xy1              0.5110 0.2054 0.7064 0.5776
+competitor_default        0.5103 0.1997 0.7044 0.5823  (= tlow_0.5)
+our_old_defaults          0.4940 0.1907 0.6551 0.5928
+tlow_0.3                  0.4892 0.1901 0.6307 0.6041  ← WORST
+```
+Key: T_low=0.6 is clearly best. T_high barely matters (0.75-0.95 all ~same).
+Closing/dust/confidence filtering had minimal impact.
+
+**Phase 6 (Exploration):** COMPLETED. Notebook executed successfully.
+
+**Pipeline completed at 02:37 Feb 18.** All 6 phases successful.
+
+**Results in:**
+- `logs/overnight_transunet.log` — full pipeline output
+- `logs/transunet_eval.csv` — per-volume scores (82 vols)
+- `logs/postprocessing_sweep.csv` — all 26 configs ranked
+- `notebooks/analysis/transunet_exploration_executed.ipynb` — visual analysis
+- `data/transunet_probmaps/` — saved probmaps for reuse
+
+### Bug fixed: TensorFlow stealing GPU memory
+
+Keras 3 imports TensorFlow even with `KERAS_BACKEND=torch`. TF was grabbing ~15 GiB GPU
+by default, causing OOM alongside PyTorch (~16 GiB for TransUNet). Fix: added
+`tf.config.set_visible_devices([], 'GPU')` at the top of all scripts. Peak VRAM dropped
+from ~30 GiB (OOM) to 16.27 GiB (forward) / 21.26 GiB (fwd+bwd).
+
+### Dry run results (2 volumes, no TTA)
+
+TransUNet pretrained (comboloss weights) at ds=1:
+- Mean comp_score: **0.5257** (with TTA) / **0.5251** (cross-scroll, 6 vols, no TTA)
+- Per-scroll: 26002=0.476, 26010=0.656, 34117=0.486, 35360=0.507, 44430=0.518, 53997=0.508
+- PP sweep: `close_z1_xy1` marginally better (0.5209 vs 0.5194 default)
+
+Full 82-volume results pending from overnight pipeline.
+
+### TransUNet setup (COMPLETED)
 - Installed Keras 3 + medicai (from GitHub source — pip version is WRONG)
 - Downloaded 3 pretrained weight sets from Kaggle (see `TRANSUNET_SETUP.md`)
 - Verified: model loads, forward pass works, produces correct (1,160,160,160,3) output
-- Memory test: peak 19.89 GB for bs=1 training on 160^3. Safe on RTX 5090 (33.7 GB).
+- Peak VRAM: 16.27 GB forward, 21.26 GB fwd+bwd (after TF GPU fix)
 - Using `KERAS_BACKEND=torch` locally for PyTorch backend
 
-**Refinement approach: ABANDONED** (GPU 3 shut down by user)
-
-**Kaggle v17: 0.431** (best public score)
-
-### Key findings this session
+### Key findings
 
 **METRIC_DOWNSAMPLE=4 inflates local scores by +0.16:**
 
@@ -101,24 +171,77 @@ Our "0.57 local val" is actually ~0.41 at full resolution. All future eval uses 
 Top approach: TransUNet SEResNeXt50, 3-class, SparseDiceCE + SkeletonRecall + FP_Volume,
 dual-stream inference, seeded hysteresis. Pretrained model gets 0.545 LB out of the box.
 
-### TransUNet Fine-Tuning Memory Budget (RTX 5090, 33.7 GB)
+### TransUNet Training Memory Budget (RTX 5090, 33.7 GB)
 
 | Config | Peak VRAM | Status |
 |--------|-----------|--------|
-| bs=1, fp32, 160^3 | 19.89 GB | Safe (13.8 GB headroom) |
-| bs=2, fp32, 160^3 | ~33.8 GB | Likely OOM |
-| bs=1, fp16, 160^3 | ~10-12 GB (est.) | Safe, enables bs=2 |
-| Recommended | bs=1 + grad_accum=4 | Simulates bs=4, 19.89 GB |
+| bs=1, fp32, 160^3, fwd only | 16.27 GB | Safe |
+| bs=1, fp32, 160^3, fwd+bwd | 21.26 GB | Safe (12.4 GB headroom) |
+| Recommended | bs=1 + grad_accum=4 | Simulates bs=4, 21.26 GB |
+| Est. 10 epochs | ~0.8 hours | Per benchmark |
 
-### What's next
+### What to do when you wake up (Feb 18)
 
-1. **Full-volume SWI inference** with TransUNet on validation set
-2. **Compare scores** to our SegResNet baseline (expect ~0.54 at ds=1 vs our 0.41)
-3. **Apply our post-processing** (hysteresis + closing + dust) to TransUNet output
-4. **Set up Kaggle submission** with TransUNet (use JAX backend on Kaggle)
-5. **Fine-tune** TransUNet with our training data + competitor loss functions
+1. **Push v21 with T_low=0.6** — Sweep shows T_low=0.6 is best (0.5179 vs 0.5103 default).
+   Update `vesuvius-inference.py` line 75: `T_low=0.60`. Push and submit. Quick win.
+2. **Investigate 0.504 vs 0.545 gap** — Our v20 scored 0.504 vs competitor's 0.545 with
+   same weights. Possible causes: PP params (T_low fix above), binary mode (try class1),
+   or subtle implementation difference in dual-stream averaging.
+3. **Try simpler single-stream** — The 0.537 baseline uses single stream + simple threshold.
+   Might score better than our dual-stream if the dual-stream implementation has issues.
+4. **Fine-tune TransUNet** — `scripts/train_transunet.py` exists but untested.
+   bs=1, grad_accum=4, ~0.8 hours for 10 epochs.
+5. **Loss functions** for fine-tuning: SparseDiceCE + 0.75*SkeletonRecall + 0.50*FP_Volume.
+   VOI is our biggest weakness (35% of metric) — need smooth, unfragmented output.
 
 **Hardware:** GPU 1 only (RTX 5090). GPU 2 paused. GPU 3 shut down.
+
+## Investigations
+
+Open questions and observations to explore. These may feed into novel approaches.
+
+### 1. Prediction thickness — our surfaces are 3-5x too thick
+
+**Observation:** Exploration notebook shows our model predicts 15-30% foreground per
+volume vs GT's 2-8%. The predicted surfaces are visibly much thicker than ground truth.
+This is likely our single biggest scoring problem.
+
+**How it hurts each metric:**
+- **SurfaceDice (35%):** Thick predictions create two boundary surfaces (top+bottom of
+  slab). One aligns with GT, the other is in empty space → ~half our surface is penalized.
+- **VOI (35%):** Excess voxels increase conditional entropy. Thickness can also merge
+  nearby parallel surfaces into one blob → wrong component count.
+- **TopoScore (30%):** Merged surfaces change B0 (component count) and can fill cavities
+  or create false tunnels.
+
+**Potential remedies — training:**
+- FP_Volume loss (already in fine-tuning) directly penalizes predictions on BG voxels
+- Boundary-focused loss that penalizes surface thickness (e.g., distance transform penalty)
+- Skeletonization loss: penalize deviation from 1-voxel-thick surfaces
+- Higher weight on FP_Volume (currently 0.50 — could try 1.0 or 2.0)
+
+**Potential remedies — post-processing:**
+- Morphological thinning / skeletonization of predictions
+- Erode-then-dilate (opening) to thin without fragmenting
+- Higher T_low (already shown to help: 0.6-0.75 better than 0.5)
+- Surface-aware thinning: keep only voxels near the probability ridge (local maxima
+  along the thickness direction)
+- Adaptive erosion: erode thick regions more than thin ones
+
+**Potential remedies — inference:**
+- Use argmax class 1 probability directly instead of binary logit (might be thinner)
+- Higher overlap SWI might produce sharper boundaries
+
+**Key question:** Is the thickness a property of the pretrained weights, or of our
+post-processing? Compare raw probmap thickness to post-processed thickness. If the
+probmap itself is thick, we need training fixes. If it's sharp but PP makes it thick,
+we need PP fixes.
+
+**Answer (confirmed from exploration notebook):** The probmaps themselves are too thick.
+This is a model-level issue in the pretrained weights, not just a PP artifact. FP_Volume
+loss in fine-tuning should help, but may need higher weight (try 1.0-2.0). Post-processing
+can also help: extract the probability ridge (non-max suppression along thickness axis)
+rather than thresholding the whole blob.
 
 ## Refinement Model (ABANDONED)
 - Approached abandoned in favor of TransUNet pivot. GPU 3 shut down.
@@ -126,51 +249,88 @@ dual-stream inference, seeded hysteresis. Pretrained model gets 0.545 LB out of 
 - If TransUNet fine-tuning leaves spare GPU time, could revisit refinement on top of
   TransUNet probmaps. Low priority.
 
-## Strategy (REVISED Feb 17 evening)
+## Strategy (REVISED Feb 18 morning)
 
-**Pivoting to TransUNet.** Our SegResNet (4.7M params) cannot compete with TransUNet
-(70.1M params). The pretrained TransUNet already scores 0.545 LB vs our 0.431. Rather
-than incremental improvements to a weak model, we adopt the winning framework directly.
+**Two-phase plan for the final 9 days.** Replaying public notebooks caps us at ~0.552.
+To reach top 10 (0.57-0.60+), we need novel approaches beyond what's publicly shared.
 
-**Priority order (10 days remaining):**
-1. **TransUNet inference pipeline** — Run pretrained model on validation set, apply our
-   post-processing, measure full-res scores. Should immediately beat our SegResNet.
-2. **Kaggle submission with TransUNet** — Adapt inference notebook for Kaggle (JAX backend,
-   offline wheels). Target: match or beat public 0.545.
-3. **Fine-tune TransUNet** — Train with competitor loss (SparseDiceCE + SkeletonRecall +
-   FP_Volume) + our data augmentation. bs=1 with grad_accum=4 on RTX 5090.
-4. **Post-processing optimization** — Dual-stream inference, seeded hysteresis, surface
-   splitting (killer ant). These are additive on top of the better base model.
-5. **Ensemble** — Fine-tuned TransUNet + pretrained TransUNet (different weights).
+### Phase 1: Aggressive / swing for the fences (Feb 18-23, 5-6 days)
+
+**Quick wins (Day 1):**
+- Push v21 with T_low=0.6 (or adaptive if analysis supports it)
+- Adaptive T_low analysis (running, results pending)
+
+**Foundation — Fine-tune TransUNet (Days 1-2):**
+- Train with SparseDiceCE + 0.75*SkeletonRecall + 0.50*FP_Volume
+- AdamW, lr=5e-5, cosine decay, wd=1e-5, bs=1 + grad_accum=4
+- 3D CutOut augmentation (6 blocks, 2-8 voxels)
+- ~1 hour per 10 epochs. Checkpoint every epoch.
+- This is table-stakes, not our differentiator.
+
+**Novel approaches — our edge (Days 3-6):**
+
+1. **Component-level learned refinement** — Fixes our old refinement's VOI problem.
+   Instead of per-voxel refinement (which fragments), operate per-component:
+   - Run base model → probmap → threshold → extract connected components
+   - Per-component features: size, shape, mean/std prob, boundary sharpness
+   - Small classifier: keep, remove, or split
+   - For splits: small model predicts WHERE to cut
+   - Can't fragment because it operates on whole components
+   - Directly targets VOI (our worst metric, 35% of score)
+   - Nobody in public notebooks does this
+
+2. **Pseudo-labeling on unlabeled regions** — Dataset has massive label=2 (ignore)
+   regions. Use pretrained model's high-confidence predictions as soft labels for
+   those regions, then retrain. Effectively multiplies training data. Well-known in
+   semi-supervised learning but not used in this competition.
+
+3. **Differentiable VOI-proxy loss** — Everyone uses DiceCE + SkeletonRecall. VOI is
+   35% of score but nobody optimizes it directly (not differentiable). Approximations:
+   penalize probability variance within neighborhoods (encourages smooth, unfragmented
+   predictions), or use soft connected-components approximation.
+
+4. **Multi-scale inference fusion** — Everyone runs at 160^3. Also run at 128^3
+   (different field of view, different boundary artifacts) and average probmaps.
+   Uncorrelated errors = free ensemble from one model.
+
+### Phase 2: Tuning and hardening (Feb 24-27, last 3-4 days)
+
+- Adaptive TTA timer (safety-critical for 9hr Kaggle limit on 120 volumes)
+- PP parameter tuning with final model
+- Kaggle notebook hardening (memory, timing, error handling)
+- Ensemble best checkpoints
+- Final submissions (keep 2-3 slots for last-minute improvements)
 
 ## Improvement Roadmap
 
 ### Done
 - [x] **Cross-scroll evaluation** — Scroll 35360 catastrophic failure → fixed with T_HIGH=0.75.
-- [x] **Adaptive thresholds** — No benefit over fixed 0.75 (8 strategies, all equal).
-- [x] **Refinement Phase 1-2** — Proof of concept. Improves topo+sdice, needs VOI fix.
+- [x] **Adaptive T_HIGH thresholds** — No benefit over fixed 0.75 (8 strategies, all equal).
+- [x] **Refinement Phase 1-2** — Proof of concept. Improves topo+sdice but destroys VOI (-0.13).
 - [x] **Metric downsample investigation** — ds=4 inflates by +0.16. Use ds=1 going forward.
 - [x] **Competitor notebook analysis** — Downloaded 17 notebooks, identified key techniques.
 - [x] **TransUNet setup** — Installed medicai, loaded pretrained weights, verified inference.
+- [x] **PP sweep** — 26 configs on 82 volumes at ds=1. T_low=0.6 best (+0.0076 over default).
+- [x] **Overnight pipeline (6 phases)** — All completed. 82-vol val, TTA, cross-scroll, PP sweep.
+- [x] **Kaggle TransUNet v20** — 0.504 public LB. Dual-stream + 7-TTA + seeded hysteresis.
 
 ### In progress
-- [~] **TransUNet full-volume inference** — Set up SWI for validation set evaluation.
+- [~] **Adaptive T_low analysis** — 20-volume sweep running. Early signal: correlations exist.
+- [~] **Fine-tune TransUNet** — Setting up training with SkeletonRecall loss.
 
-### Next up (PRIORITY ORDER)
-- [ ] **TransUNet val set evaluation** — Run pretrained TransUNet on 5+ val volumes at ds=1.
-  Compare to SegResNet baseline (expected: ~0.54 vs 0.41).
-- [ ] **Kaggle submission with TransUNet** — Adapt inference for Kaggle (JAX backend,
-  offline wheels, competitor post-processing params).
-- [ ] **Fine-tune TransUNet** — Train with SparseDiceCE + SkeletonRecall + FP_Volume.
-  bs=1, grad_accum=4, cosine decay from 5e-5. Checkpoint every epoch.
-- [ ] **Post-processing optimization** — Dual-stream inference, seeded hysteresis,
-  confidence-based CC filtering, surface splitting.
-- [ ] **Ensemble** — Average fine-tuned + pretrained TransUNet weights.
+### Next up
+- [ ] **Push v21** — T_low=0.6 (or adaptive if analysis supports it).
+- [ ] **Component-level refinement** — Novel learned post-processing targeting VOI.
+- [ ] **Pseudo-labeling** — Retrain with soft labels on unlabeled regions.
+- [ ] **Ensemble** — Fine-tuned + pretrained TransUNet logit averaging.
 
 ### Ideas on deck
-- [ ] **Surface splitting (killer ant)** — Port the post-processing from competitors.
-- [ ] **TV smoothing of probmaps** — `skimage.restoration.denoise_tv_chambolle` before thresholding.
-- [ ] **SegResNet ensemble member** — Our old model as diversity for ensemble (low priority).
+- [ ] **Differentiable VOI-proxy loss** — Approximate VOI for training.
+- [ ] **Multi-scale inference fusion** — 128^3 + 160^3 averaged.
+- [ ] **Surface splitting (killer ant)** — Port competitor post-processing.
+- [ ] **Hole filling (line tracing)** — Fill gaps in surface predictions.
+- [ ] **TV smoothing of probmaps** — Before thresholding.
+- [ ] **SegResNet as ensemble diversity member** — Different architecture, different failures.
 
 ## Kaggle Submission Quick Reference
 ```bash
@@ -195,6 +355,9 @@ tokens: `rm /tmp/.kaggle/uploads/*.json`. Use `--dir-mode zip` for subdirectorie
 | v15 | v9 traced | Feb 15 | 0.398 | Fixed thresholds. Public test = 1 volume (high variance) |
 | v16 | v9 traced | Feb 16 | PENDING | T_HIGH=0.75 (cross-scroll fix for scroll 35360) |
 | v17 | v9 traced | Feb 16 | PENDING | Adaptive T_HIGH (p95 of probs > 0.3, clamped 0.50-0.90) |
+| v18 | TransUNet comboloss | Feb 17 | FAILED | FileNotFoundError — model_sources path wrong |
+| v19 | TransUNet comboloss | Feb 17 | FAILED | Same issue (dataset not ready) |
+| v20 | TransUNet comboloss | Feb 17 | **0.504** | Dual-stream + 7-fold TTA + seeded hysteresis |
 
 ## File Structure
 ```

@@ -11,6 +11,7 @@
     "vesuvius-challenge-surface-detection"
   ],
   "dataset_sources": [
+    "tonylica/vsdetection-packages-offline-installer-only",
     "mgoldfield/vesuvius-unet3d-weights"
   ],
   "kernel_sources": []

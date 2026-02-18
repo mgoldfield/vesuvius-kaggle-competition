@@ -1,433 +1,341 @@
 """
-Vesuvius Challenge - Surface Detection: Inference Notebook
-SegResNet sliding window inference on test volumes.
-Inference v3: Gaussian SWI + logit TTA + hysteresis + surface splitting + 160^3.
-Model exported via torch.jit.trace (no MONAI dependency needed).
+Vesuvius Challenge - Surface Detection: TransUNet Inference
+Dual-stream inference with seeded hysteresis post-processing.
+Uses pretrained TransUNet SEResNeXt50 (comboloss weights, LB 0.545).
+Based on Tony Li's 0.552 approach with public-anchored weak region expansion.
 """
 import subprocess
 import sys
-import torch
-import numpy as np
-from PIL import Image
-from pathlib import Path
-import pandas as pd
-import zipfile
+import os
 import time
-from scipy.ndimage import (
-    generate_binary_structure, binary_propagation,
-    binary_closing, label as scipy_label,
+import zipfile
+
+# ── Install offline dependencies ──────────────────────────
+# Protobuf stability
+os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
+os.environ["KERAS_BACKEND"] = "jax"
+os.environ.setdefault("OMP_NUM_THREADS", "4")
+os.environ.setdefault("MKL_NUM_THREADS", "4")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "4")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "4")
+
+WHEELS_DIR = "/kaggle/input/vsdetection-packages-offline-installer-only/whls"
+print(f"Installing offline wheels from {WHEELS_DIR}...")
+subprocess.check_call([
+    sys.executable, "-m", "pip", "install",
+    "--no-index",
+    "--find-links", WHEELS_DIR,
+    "keras-nightly", "tifffile", "imagecodecs", "medicai",
+])
+print("Wheels installed.")
+
+# ── Protobuf compatibility patch ──────────────────────────
+try:
+    from google.protobuf import message_factory as _message_factory
+    if not hasattr(_message_factory.MessageFactory, "GetPrototype"):
+        from google.protobuf.message_factory import GetMessageClass
+        def _GetPrototype(self, descriptor):
+            return GetMessageClass(descriptor)
+        _message_factory.MessageFactory.GetPrototype = _GetPrototype
+        print("Patched protobuf: added MessageFactory.GetPrototype")
+except Exception as e:
+    print("Could not patch protobuf MessageFactory:", e)
+
+# ── Imports ───────────────────────────────────────────────
+import numpy as np
+import pandas as pd
+import tifffile
+import scipy.ndimage as ndi
+from skimage.morphology import remove_small_objects
+import keras
+from medicai.transforms import Compose, NormalizeIntensity
+from medicai.models import TransUNet
+from medicai.utils.inference import SlidingWindowInference
+
+print(f"Keras backend: {keras.config.backend()}, version: {keras.version()}")
+
+# ── Configuration ─────────────────────────────────────────
+CFG = dict(
+    # Model weights (comboloss, LB 0.545 as single-stream)
+    weights_path="/kaggle/input/vesuvius-unet3d-weights/transunet.seresnext50.160px.comboloss.weights.h5",
+
+    # SWI overlaps: dual-stream (Tony Li's 0.552 approach)
+    overlap_public=0.42,   # public stream (argmax labels)
+    overlap_base=0.43,     # private stream (TTA augmentations)
+    overlap_hi=0.60,       # private stream (original orientation only)
+    OV06_MAIN_ONLY=True,   # Use high-overlap only for identity augmentation
+
+    # TTA: 7-fold (identity + 3 flips + 3 rotations)
+    USE_TTA=True,
+
+    # Binary logit mode: fg12 = logsumexp(L1, L2) - L0
+    INK_MODE="fg12",
+
+    # Hysteresis thresholds
+    T_low=0.50,
+    T_high=0.90,
+
+    # Closing and dust removal
+    z_radius=3,
+    xy_radius=2,
+    dust_min_size=100,
+
+    # Warmup (JAX JIT compilation)
+    DO_WARMUP=True,
 )
 
-# ── Install surface splitting dependencies from bundled wheels ──
-# Wheels may be at wheels/ (direct upload) or wheels/wheels/ (--dir-mode zip nesting)
-_WEIGHTS_BASE = Path("/kaggle/input/vesuvius-unet3d-weights")
-_WHEELS_CANDIDATES = [
-    _WEIGHTS_BASE / "wheels",
-    _WEIGHTS_BASE / "wheels" / "wheels",
-]
-_WHEELS_DIR = None
-for _candidate in _WHEELS_CANDIDATES:
-    if _candidate.exists() and any(_candidate.glob("*.whl")):
-        _WHEELS_DIR = _candidate
-        break
+# ── Paths ─────────────────────────────────────────────────
+ROOT_DIR = "/kaggle/input/vesuvius-challenge-surface-detection"
+TEST_DIR = f"{ROOT_DIR}/test_images"
+OUTPUT_DIR = "/kaggle/working/submission_masks"
+ZIP_PATH = "/kaggle/working/submission.zip"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-if _WHEELS_DIR is None:
-    print("ERROR: No wheels directory with .whl files found!")
-    print(f"  Searched: {[str(c) for c in _WHEELS_CANDIDATES]}")
-    print(f"  Contents of {_WEIGHTS_BASE}:")
-    for p in sorted(_WEIGHTS_BASE.rglob("*"))[:30]:
-        print(f"    {p}")
-    raise FileNotFoundError(f"Wheels not found in any of: {_WHEELS_CANDIDATES}")
+ROI = (160, 160, 160)
 
-print(f"Found wheels at: {_WHEELS_DIR}")
-print(f"  Contents: {[p.name for p in _WHEELS_DIR.glob('*.whl')]}")
-try:
-    import cc3d
-    import dijkstra3d
-    print("cc3d and dijkstra3d already available")
-except ImportError:
-    print("Installing cc3d and dijkstra3d from bundled wheels...")
-    subprocess.check_call([
-        sys.executable, "-m", "pip", "install",
-        "--no-index", "--find-links", str(_WHEELS_DIR),
-        "connected-components-3d", "dijkstra3d",
-    ])
-    import cc3d
-    import dijkstra3d
-    print(f"Installed cc3d and dijkstra3d")
-HAS_SURFACE_SPLITTER = True
-import scipy.ndimage as ndi
+test_df = pd.read_csv(f"{ROOT_DIR}/test.csv")
+ids = test_df["id"].tolist()
+print(f"Test volumes: {len(ids)}")
 
-# ── Paths ──────────────────────────────────────────────────
-WEIGHTS_DIR = Path("/kaggle/input/vesuvius-unet3d-weights")
-DATA_DIR = Path("/kaggle/input/vesuvius-challenge-surface-detection")
-TEST_IMG = DATA_DIR / "test_images"
-SUBMISSION_DIR = Path("/kaggle/working/submission")
-SUBMISSION_DIR.mkdir(exist_ok=True, parents=True)
+# ── Data transforms ───────────────────────────────────────
+_val_pipeline = Compose([
+    NormalizeIntensity(keys=["image"], nonzero=True, channel_wise=False),
+])
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-PATCH_SIZE = 160
-STRIDE = 80
-T_LOW = 0.35
-T_HIGH_FIXED = 0.75  # fallback if adaptive fails
-USE_ADAPTIVE_THRESHOLD = True  # per-volume adaptive T_HIGH
-CLOSING_Z_RADIUS = 2
-CLOSING_XY_RADIUS = 1
-DUST_MIN_SIZE = 100
-USE_TTA = True
-USE_SURFACE_SPLIT = False  # disabled — never evaluated, too slow (~80 min/vol on P100)
+def val_transformation(image):
+    return _val_pipeline({"image": image})["image"]
 
-print(f"Device: {DEVICE}")
-if torch.cuda.is_available():
-    print(f"GPU: {torch.cuda.get_device_name(0)}")
-print(f"Patch size: {PATCH_SIZE}^3, Stride: {STRIDE}")
-print(f"Hysteresis: T_low={T_LOW}, T_high={'adaptive (p95>0.3)' if USE_ADAPTIVE_THRESHOLD else T_HIGH_FIXED}")
-print(f"TTA: {'ON (7-fold)' if USE_TTA else 'OFF'}")
-print(f"Surface splitting: {'ON' if USE_SURFACE_SPLIT and HAS_SURFACE_SPLITTER else 'OFF'}")
+def load_volume(path):
+    vol = tifffile.imread(path).astype(np.float32)
+    return vol[None, ..., None]  # (1, D, H, W, 1)
 
-# ── Load Model (traced — no MONAI needed) ──────────────────
-weights_path = WEIGHTS_DIR / "best_segresnet_v9_traced.pt"
-model = torch.jit.load(weights_path, map_location=DEVICE)
-model.eval()
-print(f"Model loaded from {weights_path}")
+# ── Numerics ──────────────────────────────────────────────
+def sigmoid_stable(x):
+    x = np.asarray(x, dtype=np.float32)
+    out = np.empty_like(x, dtype=np.float32)
+    pos = x >= 0
+    out[pos] = 1.0 / (1.0 + np.exp(-x[pos]))
+    ex = np.exp(x[~pos])
+    out[~pos] = ex / (1.0 + ex)
+    return out
 
+def logsumexp2(a, b):
+    a = np.asarray(a, dtype=np.float32)
+    b = np.asarray(b, dtype=np.float32)
+    m = np.maximum(a, b)
+    return m + np.log(np.exp(a - m) + np.exp(b - m) + 1e-12)
 
-# ── TIFF I/O using Pillow (handles LZW without imagecodecs) ─
-def read_tiff_volume(path):
-    """Read a multi-page TIFF as a 3D numpy array using Pillow."""
-    img = Image.open(path)
-    slices = []
-    for i in range(img.n_frames):
-        img.seek(i)
-        slices.append(np.array(img))
-    return np.stack(slices)
+def binary_logit_from_multiclass_logits(logits_5d, mode="fg12"):
+    """Convert 3-class logits (1,D,H,W,3) to binary logit (D,H,W)."""
+    x = np.asarray(logits_5d, dtype=np.float32)[0]  # (D,H,W,3)
+    L0, L1, L2 = x[..., 0], x[..., 1], x[..., 2]
+    if mode == "fg12":
+        return (logsumexp2(L1, L2) - L0).astype(np.float32, copy=False)
+    elif mode == "class1":
+        return (L1 - logsumexp2(L0, L2)).astype(np.float32, copy=False)
+    else:
+        raise ValueError(f"Unknown INK_MODE={mode}")
 
-
-def write_tiff_volume(path, volume):
-    """Write a 3D numpy array as a multi-page TIFF using Pillow."""
-    frames = [Image.fromarray(volume[i]) for i in range(volume.shape[0])]
-    frames[0].save(path, save_all=True, append_images=frames[1:])
-
-
-# ── Gaussian Importance Map ───────────────────────────────
-def _build_gaussian_map(patch_size, sigma_scale=0.125):
-    """
-    Build a 3D Gaussian importance map for SWI blending.
-    Center voxels get weight ~1.0, edges taper to near-zero.
-    sigma_scale: fraction of patch_size for Gaussian sigma (0.125 = MONAI default).
-    """
-    sigma = patch_size * sigma_scale
-    ax = np.arange(patch_size, dtype=np.float32)
-    center = (patch_size - 1) / 2.0
-    gauss_1d = np.exp(-0.5 * ((ax - center) / sigma) ** 2)
-    gauss_3d = gauss_1d[:, None, None] * gauss_1d[None, :, None] * gauss_1d[None, None, :]
-    # Normalize so max is 1.0 (avoids numerical issues)
-    gauss_3d /= gauss_3d.max()
-    # Clamp to small positive value to avoid division by zero
-    gauss_3d = np.clip(gauss_3d, 1e-6, None)
-    return gauss_3d
-
-
-# Pre-build the Gaussian map (reused for all patches)
-GAUSSIAN_MAP = _build_gaussian_map(PATCH_SIZE)
-print(f"Gaussian importance map: min={GAUSSIAN_MAP.min():.4f}, max={GAUSSIAN_MAP.max():.4f}")
-
-
-# ── Sliding Window Inference (Gaussian-weighted, returns logits) ──
-def sliding_window_inference(model, volume, patch_size=160, stride=80, device="cuda"):
-    """
-    Run inference on a full 320^3 volume using overlapping patches.
-    Uses Gaussian importance weighting for smooth blending (center > edges).
-    Returns raw logits (pre-sigmoid) for logit-space TTA averaging.
-    """
-    D, H, W = volume.shape
-    ps = patch_size
-    gauss = GAUSSIAN_MAP
-
-    output = np.zeros((D, H, W), dtype=np.float32)
-    weights = np.zeros((D, H, W), dtype=np.float32)
-
-    def _positions(length, ps, stride):
-        pos = list(range(0, length - ps, stride))
-        if not pos or pos[-1] + ps < length:
-            pos.append(length - ps)
-        return pos
-
-    z_pos = _positions(D, ps, stride)
-    y_pos = _positions(H, ps, stride)
-    x_pos = _positions(W, ps, stride)
-
-    with torch.no_grad(), torch.amp.autocast("cuda"):
-        for z in z_pos:
-            for y in y_pos:
-                for x in x_pos:
-                    patch = volume[z:z+ps, y:y+ps, x:x+ps]
-                    patch_t = torch.from_numpy(patch).float().unsqueeze(0).unsqueeze(0).to(device) / 255.0
-                    logits = model(patch_t).squeeze().cpu().numpy()
-                    output[z:z+ps, y:y+ps, x:x+ps] += logits * gauss
-                    weights[z:z+ps, y:y+ps, x:x+ps] += gauss
-
-    output /= weights
-    return output  # raw logits, not probabilities
-
-
-# ── TTA: 7-fold test-time augmentation (logit-space) ──────
-def sliding_window_inference_tta(model, volume, patch_size=160, stride=80, device="cuda"):
-    """
-    7-fold TTA: original + 3 axis flips + 3 HW-plane rotations (90/180/270).
-    Averages in logit space (before sigmoid) for more principled aggregation.
-    Returns probability map (sigmoid applied after averaging logits).
-    """
-    logits_sum = np.zeros_like(volume, dtype=np.float32)
-
-    # 1. Original
-    logits_sum += sliding_window_inference(model, volume, patch_size, stride, device)
-
-    # 2-4. Axis flips (z, y, x)
-    for axis in range(3):
-        flipped = np.flip(volume, axis=axis).copy()
-        logits = sliding_window_inference(model, flipped, patch_size, stride, device)
-        logits_sum += np.flip(logits, axis=axis).copy()
-
-    # 5-7. HW-plane (axes 1,2) rotations: 90, 180, 270 degrees
-    for k in [1, 2, 3]:
-        rotated = np.rot90(volume, k=k, axes=(1, 2)).copy()
-        logits = sliding_window_inference(model, rotated, patch_size, stride, device)
-        logits_sum += np.rot90(logits, k=-k, axes=(1, 2)).copy()
-
-    # Average logits, then apply sigmoid
-    mean_logits = logits_sum / 7.0
-    return 1.0 / (1.0 + np.exp(-mean_logits))  # sigmoid
-
-
-# ── Adaptive T_HIGH threshold ─────────────────────────────
-def adaptive_t_high(prob, min_prob=0.3, percentile=95):
-    """
-    Per-volume adaptive T_HIGH = 95th percentile of probabilities above min_prob.
-    Prevents catastrophic failure when a volume's max prob is below a fixed threshold.
-    Clamped to [0.50, 0.90] for safety.
-    """
-    high_probs = prob[prob > min_prob].astype(np.float32)
-    if len(high_probs) > 0:
-        t_high = float(np.percentile(high_probs, percentile))
-        return np.clip(t_high, 0.50, 0.90)
-    return 0.50
-
-
-# ── Hysteresis thresholding ────────────────────────────────
-def hysteresis_threshold(prob, t_low=0.35, t_high=0.85):
-    """Dual-threshold seed-and-propagate with 26-connectivity."""
-    strong = prob >= t_high
-    weak = prob >= t_low
-    struct = generate_binary_structure(3, 3)  # 26-connectivity
-    return binary_propagation(strong, structure=struct, mask=weak).astype(np.uint8)
-
-
-# ── Anisotropic closing ───────────────────────────────────
-def build_anisotropic_struct(z_radius=2, xy_radius=1):
-    """Z-heavy structuring element: disk in XY, extended in Z."""
-    sz = 2 * z_radius + 1
-    sxy = 2 * xy_radius + 1
-    struct = np.zeros((sz, sxy, sxy), dtype=bool)
-    cy, cx = xy_radius, xy_radius
-    for y in range(sxy):
-        for x in range(sxy):
-            if (y - cy)**2 + (x - cx)**2 <= xy_radius**2:
-                struct[:, y, x] = True
+# ── Post-processing helpers ───────────────────────────────
+def build_anisotropic_struct(z_radius, xy_radius):
+    z, r = int(z_radius), int(xy_radius)
+    if z == 0 and r == 0:
+        return None
+    if z == 0 and r > 0:
+        size = 2 * r + 1
+        struct = np.zeros((1, size, size), dtype=bool)
+        cy = cx = r
+        for dy in range(-r, r + 1):
+            for dx in range(-r, r + 1):
+                if dy * dy + dx * dx <= r * r:
+                    struct[0, cy + dy, cx + dx] = True
+        return struct
+    if z > 0 and r == 0:
+        struct = np.zeros((2 * z + 1, 1, 1), dtype=bool)
+        struct[:, 0, 0] = True
+        return struct
+    depth = 2 * z + 1
+    size = 2 * r + 1
+    struct = np.zeros((depth, size, size), dtype=bool)
+    cz = z
+    cy = cx = r
+    for dz in range(-z, z + 1):
+        for dy in range(-r, r + 1):
+            for dx in range(-r, r + 1):
+                if dy * dy + dx * dx <= r * r:
+                    struct[cz + dz, cy + dy, cx + dx] = True
     return struct
 
+def seeded_hysteresis_with_topology(
+    prob, pub_fg_bool,
+    T_low=0.50, T_high=0.90,
+    z_radius=3, xy_radius=2, dust_min_size=100,
+):
+    """Seeded hysteresis with public-stream weak region expansion."""
+    prob = np.asarray(prob, dtype=np.float32)
+    strong = prob >= float(T_high)
 
-# ── Post-processing pipeline ──────────────────────────────
-def postprocess(probs, t_low=0.35, t_high=0.85, z_radius=2, xy_radius=1, min_size=100):
-    """Hysteresis thresholding + anisotropic closing + dust removal."""
-    # 1. Hysteresis thresholding
-    binary = hysteresis_threshold(probs, t_low, t_high)
+    # Weak includes private weak OR public foreground (the key insight)
+    weak = (prob >= float(T_low)) | pub_fg_bool
 
-    # 2. Anisotropic closing
-    struct = build_anisotropic_struct(z_radius, xy_radius)
-    closed = binary_closing(binary, structure=struct)
+    if not strong.any():
+        return np.zeros_like(prob, dtype=np.uint8)
 
-    # 3. Dust removal
-    labeled, n_components = scipy_label(closed)
-    if n_components > 0:
-        component_sizes = np.bincount(labeled.ravel())
-        small_mask = component_sizes < min_size
-        small_mask[0] = False
-        closed[small_mask[labeled]] = 0
+    struct_hyst = ndi.generate_binary_structure(3, 3)
+    mask = ndi.binary_propagation(strong, mask=weak, structure=struct_hyst)
 
-    return closed.astype(np.uint8)
+    if not mask.any():
+        return np.zeros_like(prob, dtype=np.uint8)
 
+    struct_close = build_anisotropic_struct(z_radius, xy_radius)
+    if struct_close is not None:
+        mask = ndi.binary_closing(mask, structure=struct_close)
 
-# ── Surface Splitting (Killer Ant algorithm) ─────────────────
-# Adapted from hengck23's "Marching Ants" post-processing.
-# Detects merged papyrus sheets via raycasting and splits them
-# using Dijkstra3D shortest paths. Directly improves TopoScore + VOI.
+    if int(dust_min_size) > 0:
+        mask = remove_small_objects(mask.astype(bool), min_size=int(dust_min_size))
 
-SPLIT_RAYCAST_IOU = 0.1
-SPLIT_RANGE = 20
-SPLIT_MIN_POINTS = 8
-SPLIT_MAX_TRIAL = 100
-SPLIT_REMOVE_THR = 0.9
-SPLIT_MAX_DEPTH = 50
+    return mask.astype(np.uint8)
 
+# ── TTA augmentations ─────────────────────────────────────
+def iter_tta(volume):
+    """Generate 7 TTA augmentations: identity + 3 flips + 3 rotations."""
+    yield volume, (lambda y: y)
+    for axis in [1, 2, 3]:
+        v = np.flip(volume, axis=axis)
+        inv = (lambda y, axis=axis: np.flip(y, axis=axis))
+        yield v, inv
+    for k in [1, 2, 3]:
+        v = np.rot90(volume, k=k, axes=(2, 3))
+        inv = (lambda y, k=k: np.rot90(y, k=-k, axes=(2, 3)))
+        yield v, inv
 
-def _split_range_intervals(d, min_size=64):
-    k = max(1, d // min_size)
-    edges = np.linspace(0, d, k + 1, dtype=int)
-    edges[-1] = d
-    return [(edges[i], edges[i + 1]) for i in range(k)]
+# ── Model + SWI setup ─────────────────────────────────────
+print(f"Loading TransUNet from {CFG['weights_path']}")
+model = TransUNet(
+    input_shape=(160, 160, 160, 1),
+    encoder_name="seresnext50",
+    classifier_activation=None,  # raw logits for binary conversion
+    num_classes=3,
+)
+model.load_weights(CFG["weights_path"])
+print(f"Model params: {model.count_params() / 1e6:.1f}M")
 
+def build_swi(overlap):
+    return SlidingWindowInference(
+        model,
+        num_classes=3,
+        roi_size=ROI,
+        sw_batch_size=1,
+        mode="gaussian",
+        overlap=float(overlap),
+    )
 
-def _raycast_iou(p1, p2, h, w):
-    """Check if two 2D point sets (Nx2, yx format) overlap in YX projection."""
-    by1 = np.bincount(p1[:, 0], minlength=h)
-    by2 = np.bincount(p2[:, 0], minlength=h)
-    bx1 = np.bincount(p1[:, 1], minlength=w)
-    bx2 = np.bincount(p2[:, 1], minlength=w)
-    combined1 = np.concatenate([by1, bx1]) != 0
-    combined2 = np.concatenate([by2, bx2]) != 0
-    inter = (combined1 & combined2).sum()
-    union = (combined1 | combined2).sum()
-    return inter / (union + 1e-6)
+swi_public = build_swi(CFG["overlap_public"])  # public stream (argmax)
+swi_base = build_swi(CFG["overlap_base"])      # private stream (TTA augs)
+swi_hi = build_swi(CFG["overlap_hi"])          # private stream (identity)
 
+# ── Dual-stream prediction ────────────────────────────────
+def predict_pub_labels_and_private_prob(volume):
+    """
+    Dual-stream inference:
+    - Public stream: average multiclass logits -> argmax labels
+    - Private stream: average binary logits -> probability
+    """
+    mode = CFG["INK_MODE"]
 
-def _find_multi_surface_seeds(component):
-    """Detect if a 3D component contains multiple overlapping surfaces."""
-    d, h, w = component.shape
-    for z1, z2 in _split_range_intervals(d, min_size=SPLIT_RANGE):
-        z = (z1 + z2) // 2
-        ccz = cc3d.connected_components(component[z])
-        points = []
-        for i in range(1, ccz.max() + 1):
-            p = np.stack(np.where(ccz == i)).T
-            if len(p) >= SPLIT_MIN_POINTS:
-                points.append(p)
-        if len(points) <= 1:
-            continue
-        for i1 in range(len(points)):
-            for i2 in range(i1 + 1, len(points)):
-                if _raycast_iou(points[i1], points[i2], h, w) >= SPLIT_RAYCAST_IOU:
-                    z_col = np.full((len(points[i1]), 1), z, dtype=points[i1].dtype)
-                    p1_zyx = np.concatenate([z_col, points[i1]], -1)
-                    z_col2 = np.full((len(points[i2]), 1), z, dtype=points[i2].dtype)
-                    p2_zyx = np.concatenate([z_col2, points[i2]], -1)
-                    return True, p1_zyx, p2_zyx
-    return False, None, None
+    if not CFG["USE_TTA"]:
+        l_pub = np.asarray(swi_public(volume))
+        pub_labels = l_pub.argmax(-1).astype(np.uint8).squeeze()
+        l_prv = np.asarray(swi_hi(volume))
+        s = binary_logit_from_multiclass_logits(l_prv, mode=mode)
+        prob = sigmoid_stable(s)
+        return pub_labels, prob
 
+    logits_sum = None
+    s_sum = None
+    n = 0
 
-def _split_component(component, p1_zyx, p2_zyx):
-    """Split a component into two via Dijkstra path removal."""
-    problem = component.copy()
-    for trial in range(SPLIT_MAX_TRIAL):
-        paths = []
-        k1 = np.arange(len(p1_zyx))
-        np.random.shuffle(k1)
-        for (sz, sy, sx) in p1_zyx[k1[:8]]:
-            parent = dijkstra3d.parental_field(
-                np.where(problem, 1.0, 1e6).astype(np.float32),
-                source=(sz, sy, sx), connectivity=26)
-            k2 = np.arange(len(p2_zyx))
-            np.random.shuffle(k2)
-            for (ez, ey, ex) in p2_zyx[k2[:8]]:
-                paths.append(dijkstra3d.path_from_parents(parent, (ez, ey, ex)))
-        path_flat = np.concatenate(paths)
-        if np.any(~problem[path_flat[:, 0], path_flat[:, 1], path_flat[:, 2]]):
-            return True, cc3d.connected_components(problem)
-        uniq, cnt = np.unique(path_flat, axis=0, return_counts=True)
-        order = np.argsort(-cnt)
-        uniq, cnt = uniq[order], cnt[order]
-        threshold = SPLIT_REMOVE_THR * cnt.max()
-        u = uniq[cnt >= threshold]
-        larger = np.zeros_like(problem, dtype=bool)
-        larger[u[:, 0], u[:, 1], u[:, 2]] = True
-        larger = ndi.binary_dilation(larger, structure=np.ones((3, 3, 3), dtype=bool), iterations=1)
-        problem[larger] = False
-    return False, problem
+    for t, (v, inv) in enumerate(iter_tta(volume)):
+        # Public stream
+        l_pub = np.asarray(swi_public(v))
+        l_pub = inv(l_pub)
+        logits_sum = l_pub.astype(np.float32) if logits_sum is None else (logits_sum + l_pub.astype(np.float32))
 
+        # Private stream (high overlap for identity only)
+        if CFG["OV06_MAIN_ONLY"]:
+            swi_use = swi_hi if (t == 0) else swi_base
+        else:
+            swi_use = swi_hi
 
-def _recursive_split(component, result, depth=0):
-    """Recursively split until each piece is a single surface."""
-    if depth >= SPLIT_MAX_DEPTH:
-        result.append(component)
-        return
-    is_multi, p1, p2 = _find_multi_surface_seeds(component)
-    if not is_multi:
-        result.append(component)
-        return
-    success, solved = _split_component(component, p1, p2)
-    if not success:
-        result.append(component)
-        return
-    _recursive_split(solved == 1, result, depth + 1)
-    _recursive_split(solved == 2, result, depth + 1)
+        l_prv = np.asarray(swi_use(v))
+        l_prv = inv(l_prv)
+        s = binary_logit_from_multiclass_logits(l_prv, mode=mode)
+        s_sum = s.astype(np.float32) if s_sum is None else (s_sum + s.astype(np.float32))
 
+        n += 1
 
-def split_merged_surfaces(binary_mask, min_size=100):
-    """Split merged papyrus sheets in a binary mask. Returns binary uint8."""
-    labeled = cc3d.connected_components(binary_mask.astype(np.uint8))
-    n = labeled.max()
-    if n == 0:
-        return binary_mask
-    surfaces = []
-    for cid in range(1, n + 1):
-        comp = (labeled == cid)
-        if comp.sum() < min_size:
-            surfaces.append(comp)
-            continue
-        result = []
-        _recursive_split(comp, result)
-        surfaces.extend(result)
-    output = np.zeros_like(binary_mask, dtype=np.uint8)
-    for s in surfaces:
-        output[s > 0] = 1
-    return output
+    mean_logits = logits_sum / float(n)
+    pub_labels = mean_logits.argmax(-1).astype(np.uint8).squeeze()
 
+    s_mean = (s_sum / float(n)).astype(np.float32, copy=False)
+    prob = sigmoid_stable(s_mean)
+    return pub_labels, prob
 
-# ── Run on Test Volumes ────────────────────────────────────
-test_df = pd.read_csv(DATA_DIR / "test.csv")
-print(f"\nTest volumes: {len(test_df)}")
+# ── Warmup (JAX JIT compilation) ──────────────────────────
+def warmup(volume):
+    print("Warming up JAX (compile once)...")
+    _ = np.asarray(swi_public(volume))
+    _ = np.asarray(swi_base(volume))
+    _ = np.asarray(swi_hi(volume))
+    print("Warmup done.")
 
-def sliding_window_inference_prob(model, volume, patch_size=160, stride=80, device="cuda"):
-    """Non-TTA path: sliding window returning probabilities (sigmoid applied)."""
-    logits = sliding_window_inference(model, volume, patch_size, stride, device)
-    return 1.0 / (1.0 + np.exp(-logits))
+# ── Main inference loop ───────────────────────────────────
+print(f"\nConfig: overlap_public={CFG['overlap_public']}, overlap_base={CFG['overlap_base']}, "
+      f"overlap_hi={CFG['overlap_hi']}")
+print(f"INK_MODE={CFG['INK_MODE']}, T_low={CFG['T_low']}, T_high={CFG['T_high']}")
+print(f"TTA={'ON (7-fold)' if CFG['USE_TTA'] else 'OFF'}, "
+      f"OV06_MAIN_ONLY={CFG['OV06_MAIN_ONLY']}")
+print(f"Closing: z={CFG['z_radius']}, xy={CFG['xy_radius']}, dust={CFG['dust_min_size']}")
 
-infer_fn = sliding_window_inference_tta if USE_TTA else sliding_window_inference_prob
+t_global0 = time.perf_counter()
 
-for i, row in test_df.iterrows():
-    vol_id = row.id
-    img_path = TEST_IMG / f"{vol_id}.tif"
-    if not img_path.exists():
-        print(f"  [{i+1}/{len(test_df)}] Skipping {vol_id}: not found")
-        continue
+with zipfile.ZipFile(ZIP_PATH, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+    for i, image_id in enumerate(ids):
+        t0 = time.perf_counter()
 
-    print(f"  [{i+1}/{len(test_df)}] Predicting {vol_id}...", end=" ", flush=True)
-    t0 = time.time()
-    img = read_tiff_volume(img_path)
-    prob = infer_fn(model, img, patch_size=PATCH_SIZE, stride=STRIDE, device=DEVICE)
-    t_high = adaptive_t_high(prob) if USE_ADAPTIVE_THRESHOLD else T_HIGH_FIXED
-    pred = postprocess(prob, t_low=T_LOW, t_high=t_high,
-                       z_radius=CLOSING_Z_RADIUS, xy_radius=CLOSING_XY_RADIUS,
-                       min_size=DUST_MIN_SIZE)
+        tif_path = f"{TEST_DIR}/{image_id}.tif"
+        volume = load_volume(tif_path)
+        volume = val_transformation(volume)
 
-    if USE_SURFACE_SPLIT and HAS_SURFACE_SPLITTER:
-        pred = split_merged_surfaces(pred, min_size=DUST_MIN_SIZE)
+        if i == 0 and CFG["DO_WARMUP"]:
+            warmup(volume)
 
-    out_path = SUBMISSION_DIR / f"{vol_id}.tif"
-    write_tiff_volume(out_path, pred)
-    fg = pred.sum()
-    elapsed = time.time() - t0
-    print(f"T_high={t_high:.3f} fg={fg}/{pred.size} ({fg/pred.size*100:.1f}%) [{elapsed:.1f}s]")
+        pub_labels, prob = predict_pub_labels_and_private_prob(volume)
 
-print("\nInference complete.")
+        # Public foreground anchor (weak region expansion)
+        pub_fg = (pub_labels != 0)
 
+        # Seeded hysteresis + closing + dust removal
+        output = seeded_hysteresis_with_topology(
+            prob,
+            pub_fg_bool=pub_fg,
+            T_low=CFG["T_low"],
+            T_high=CFG["T_high"],
+            z_radius=CFG["z_radius"],
+            xy_radius=CFG["xy_radius"],
+            dust_min_size=CFG["dust_min_size"],
+        )
 
-# ── Create submission.zip ──────────────────────────────────
-zip_path = Path("/kaggle/working/submission.zip")
-with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-    for tif in sorted(SUBMISSION_DIR.glob("*.tif")):
-        zf.write(tif, tif.name)
+        out_path = f"{OUTPUT_DIR}/{image_id}.tif"
+        tifffile.imwrite(out_path, output.astype(np.uint8))
+        zf.write(out_path, arcname=f"{image_id}.tif")
+        os.remove(out_path)
 
-print(f"\nSubmission: {zip_path}")
-print(f"Size: {zip_path.stat().st_size / 1e6:.1f} MB")
-print(f"Files: {len(list(SUBMISSION_DIR.glob('*.tif')))}")
+        dt = time.perf_counter() - t0
+        elapsed = time.perf_counter() - t_global0
+        print(f"[{i+1}/{len(ids)}] id={image_id} | {dt/60:.2f} min | "
+              f"elapsed {elapsed/3600:.2f} h | positives={int(output.sum())}")
+
+print(f"\nSubmission ZIP: {ZIP_PATH}")
+total_time = time.perf_counter() - t_global0
+print(f"Total time: {total_time/3600:.2f} hours")

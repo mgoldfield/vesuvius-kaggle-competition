@@ -1,0 +1,428 @@
+#!/usr/bin/env python3
+"""
+Fine-tune pretrained TransUNet SEResNeXt50 on our training data.
+
+Implements the competitor training pipeline:
+- Loss: SparseDiceCE + w_srec*SkeletonRecall + w_fp*FP_Volume + w_dist*DistFromSkeleton
+- Augmentation: flips, rotations, intensity shift, 3D CutOut
+- Schedule: AdamW, cosine decay from 5e-5, weight_decay=1e-5
+- Checkpoints every epoch
+
+Usage:
+    # Run 1: Competitor baseline (default weights)
+    python scripts/train_transunet.py --run-name baseline --epochs 25
+
+    # Run 2: High FP_Volume for thinner predictions
+    python scripts/train_transunet.py --run-name thin_fp15 --fp-weight 1.5 --epochs 25
+
+    # Run 3: Distance-from-skeleton penalty
+    python scripts/train_transunet.py --run-name thin_dist --dist-weight 1.0 --epochs 25
+
+    # Resume from a checkpoint
+    python scripts/train_transunet.py --run-name thin_fp15 --weights checkpoints/transunet_baseline/transunet_best.weights.h5
+
+    # Dry run (1 epoch, 5 samples)
+    python scripts/train_transunet.py --dry-run
+"""
+
+import os
+os.environ.setdefault('KERAS_BACKEND', 'torch')
+
+# Force TensorFlow to CPU-only — Keras 3 imports TF even with torch backend,
+# and TF grabs ~15 GiB GPU by default, causing OOM alongside PyTorch.
+try:
+    import tensorflow as tf
+    tf.config.set_visible_devices([], 'GPU')
+except Exception:
+    pass
+
+import argparse
+import time
+import random
+import numpy as np
+import pandas as pd
+import tifffile
+import torch
+from pathlib import Path
+from torch.utils.data import Dataset, DataLoader
+from scipy.ndimage import binary_dilation, distance_transform_edt
+from skimage.morphology import skeletonize
+
+ROOT = Path("/workspace/vesuvius-kaggle-competition")
+TRAIN_IMG = ROOT / "data" / "train_images"
+TRAIN_LBL = ROOT / "data" / "train_labels"
+DEFAULT_WEIGHTS = ROOT / "pretrained_weights" / "transunet" / "transunet.seresnext50.160px.comboloss.weights.h5"
+CKPT_DIR = ROOT / "checkpoints" / "transunet"
+
+ROI = (160, 160, 160)
+VAL_SCROLL = 26002
+
+
+# ── Dataset ──────────────────────────────────────────────
+class VesuviusPatchDataset(Dataset):
+    """Loads TIF volumes and extracts random 160^3 patches.
+
+    Caches volumes in memory after first load (~33MB each, ~23GB for 700 vols).
+    """
+
+    def __init__(self, vol_ids, train=True, patch_size=160):
+        self.vol_ids = vol_ids
+        self.train = train
+        self.patch_size = patch_size
+        self._cache = {}
+
+    def __len__(self):
+        return len(self.vol_ids)
+
+    def _load(self, vid):
+        if vid not in self._cache:
+            img = tifffile.imread(TRAIN_IMG / f"{vid}.tif")
+            lbl = tifffile.imread(TRAIN_LBL / f"{vid}.tif")
+            # Store as uint8 to save memory, convert to float32 in __getitem__
+            self._cache[vid] = (img, lbl)
+        return self._cache[vid]
+
+    def __getitem__(self, idx):
+        vid = self.vol_ids[idx]
+        img_raw, lbl_raw = self._load(vid)
+        img = img_raw.astype(np.float32)
+        lbl = lbl_raw.astype(np.float32)
+
+        ps = self.patch_size
+        D, H, W = img.shape
+
+        # Random crop (fg-biased: 50% chance to center on a foreground voxel)
+        if self.train and random.random() < 0.5:
+            fg_coords = np.argwhere(lbl == 1)
+            if len(fg_coords) > 0:
+                center = fg_coords[random.randint(0, len(fg_coords) - 1)]
+                d0 = max(0, min(center[0] - ps // 2, D - ps))
+                h0 = max(0, min(center[1] - ps // 2, H - ps))
+                w0 = max(0, min(center[2] - ps // 2, W - ps))
+            else:
+                d0 = random.randint(0, max(0, D - ps))
+                h0 = random.randint(0, max(0, H - ps))
+                w0 = random.randint(0, max(0, W - ps))
+        else:
+            d0 = random.randint(0, max(0, D - ps))
+            h0 = random.randint(0, max(0, H - ps))
+            w0 = random.randint(0, max(0, W - ps))
+
+        img_patch = img[d0:d0+ps, h0:h0+ps, w0:w0+ps]
+        lbl_patch = lbl[d0:d0+ps, h0:h0+ps, w0:w0+ps]
+
+        if self.train:
+            img_patch, lbl_patch = self._augment(img_patch, lbl_patch)
+
+        # Normalize: scale 0-255 to 0-1
+        img_patch = img_patch / 255.0
+
+        # Generate skeleton target and distance map for training
+        skel = self._generate_skeleton(lbl_patch)
+        dist = self._generate_dist_from_skeleton(lbl_patch)
+
+        # channels-last format: (D, H, W, 1) and (D, H, W, 3)
+        img_out = img_patch[..., None]  # (D,H,W,1)
+        lbl_out = np.stack([lbl_patch, skel, dist], axis=-1)  # (D,H,W,3)
+
+        return img_out.astype(np.float32), lbl_out.astype(np.float32)
+
+    def _augment(self, img, lbl):
+        """Competitor augmentation: flips, rotations, intensity shift, 3D CutOut."""
+        # Random flips (all 3 axes, p=0.5)
+        for axis in range(3):
+            if random.random() < 0.5:
+                img = np.flip(img, axis=axis).copy()
+                lbl = np.flip(lbl, axis=axis).copy()
+
+        # Random 90-degree rotations (axes 0,1, p=0.4)
+        if random.random() < 0.4:
+            k = random.randint(1, 3)
+            img = np.rot90(img, k=k, axes=(0, 1)).copy()
+            lbl = np.rot90(lbl, k=k, axes=(0, 1)).copy()
+
+        # Random intensity shift (+/-0.15, p=0.5)
+        if random.random() < 0.5:
+            shift = random.uniform(-0.15, 0.15) * 255
+            img = np.clip(img + shift, 0, 255)
+
+        # 3D CutOut (up to 6 random cuboid blocks, p=1.0)
+        for _ in range(6):
+            bs = random.randint(2, 8)
+            d0 = random.randint(0, max(0, img.shape[0] - bs))
+            h0 = random.randint(0, max(0, img.shape[1] - bs))
+            w0 = random.randint(0, max(0, img.shape[2] - bs))
+            img[d0:d0+bs, h0:h0+bs, w0:w0+bs] = 0
+
+        return img, lbl
+
+    def _generate_skeleton(self, lbl):
+        """Skeletonize foreground and dilate by 1."""
+        mask = (lbl == 1)
+        if not mask.any():
+            return np.zeros_like(lbl, dtype=np.float32)
+        skel = skeletonize(mask)
+        tubed = binary_dilation(skel, iterations=1)
+        return tubed.astype(np.float32)
+
+    def _generate_dist_from_skeleton(self, lbl):
+        """Distance transform from GT skeleton. Used by dist-from-skeleton loss."""
+        mask = (lbl == 1)
+        if not mask.any():
+            return np.zeros_like(lbl, dtype=np.float32)
+        skel = skeletonize(mask)
+        if not skel.any():
+            return np.zeros_like(lbl, dtype=np.float32)
+        # Distance from each voxel to nearest skeleton voxel
+        dist = distance_transform_edt(~skel).astype(np.float32)
+        # Normalize: cap at 10 voxels, scale to [0, 1]
+        dist = np.clip(dist / 10.0, 0, 1)
+        return dist
+
+
+def collate_fn(batch):
+    """Stack into numpy arrays (Keras expects numpy, not torch tensors for channels-last)."""
+    imgs, lbls = zip(*batch)
+    return np.stack(imgs), np.stack(lbls)
+
+
+# ── Loss function (Keras) ────────────────────────────────
+def build_loss(num_classes=3, w_srec=0.75, w_fp=0.50, w_dist=0.0):
+    """Build the SkeletonRecallPlusDiceLoss using Keras ops.
+
+    Args:
+        w_srec: Weight for skeleton recall loss (default 0.75)
+        w_fp: Weight for FP volume loss (default 0.50). Higher = thinner predictions.
+        w_dist: Weight for distance-from-skeleton loss (default 0.0 = disabled).
+                Penalizes predictions that are far from the GT skeleton centerline.
+    """
+    import keras
+    from medicai.losses import SparseDiceCELoss
+
+    base_loss_fn = SparseDiceCELoss(
+        from_logits=False,
+        num_classes=num_classes,
+        ignore_class_ids=2,
+    )
+
+    class SkeletonRecallPlusDiceLoss(keras.losses.Loss):
+        def call(self, y_true, y_pred):
+            y_true_mask = y_true[..., 0]
+            y_true_skel = y_true[..., 1]
+            y_true_dist = y_true[..., 2]
+
+            pred_ink_prob = y_pred[..., 1]
+            valid_mask = keras.ops.cast(y_true_mask != 2, "float32")
+
+            # 1. Base Dice+CE
+            base_loss = base_loss_fn(y_true_mask[..., None], y_pred)
+
+            # 2. Skeleton Recall
+            intersection = keras.ops.sum(
+                pred_ink_prob * y_true_skel * valid_mask, axis=(1, 2, 3)
+            )
+            skeleton_sum = keras.ops.sum(
+                y_true_skel * valid_mask, axis=(1, 2, 3)
+            )
+            has_skeleton = keras.ops.cast(skeleton_sum > 0, "float32")
+            recall = (intersection + 1e-6) / (skeleton_sum + 1e-6)
+            skel_loss = keras.ops.mean((1.0 - recall) * has_skeleton)
+
+            # 3. FP Volume
+            gt_bg = keras.ops.cast(y_true_mask == 0, "float32")
+            fp_volume = pred_ink_prob * gt_bg * valid_mask
+            fp_loss = keras.ops.sum(fp_volume) / (
+                keras.ops.sum(gt_bg * valid_mask) + 1e-6
+            )
+
+            total = base_loss + w_srec * skel_loss + w_fp * fp_loss
+
+            # 4. Distance-from-skeleton penalty (optional)
+            if w_dist > 0:
+                # Penalize predictions proportionally to their distance from
+                # the GT skeleton. Predictions ON the skeleton get zero penalty.
+                # Predictions far from it get high penalty.
+                dist_penalty = pred_ink_prob * y_true_dist * valid_mask
+                dist_loss = keras.ops.sum(dist_penalty) / (
+                    keras.ops.sum(valid_mask) + 1e-6
+                )
+                total = total + w_dist * dist_loss
+
+            return total
+
+    return SkeletonRecallPlusDiceLoss(name="skel_recall_fp_loss")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--weights', type=str, default=str(DEFAULT_WEIGHTS))
+    parser.add_argument('--epochs', type=int, default=10)
+    parser.add_argument('--lr', type=float, default=5e-5)
+    parser.add_argument('--weight-decay', type=float, default=1e-5)
+    parser.add_argument('--grad-accum', type=int, default=4)
+    parser.add_argument('--dry-run', action='store_true')
+    parser.add_argument('--save-every', type=int, default=1,
+                        help='Save checkpoint every N epochs')
+    parser.add_argument('--run-name', type=str, default='baseline',
+                        help='Name for this run (determines checkpoint dir)')
+    parser.add_argument('--fp-weight', type=float, default=0.50,
+                        help='FP_Volume loss weight (default 0.50, try 1.5 for thinner)')
+    parser.add_argument('--skel-weight', type=float, default=0.75,
+                        help='SkeletonRecall loss weight (default 0.75)')
+    parser.add_argument('--dist-weight', type=float, default=0.0,
+                        help='Distance-from-skeleton loss weight (0=disabled)')
+    args = parser.parse_args()
+
+    if args.dry_run:
+        args.epochs = 1
+
+    import keras
+    from medicai.models import TransUNet
+    from medicai.metrics import SparseDiceMetric
+
+    # Mixed precision to fit fwd+bwd in 32GB VRAM
+    keras.mixed_precision.set_global_policy('mixed_float16')
+    print("Mixed precision: float16 compute, float32 weights")
+
+    # Per-run checkpoint directory
+    ckpt_dir = ROOT / "checkpoints" / f"transunet_{args.run_name}"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── Data split ──
+    train_df = pd.read_csv(ROOT / "data" / "train.csv")
+    available = set(int(p.stem) for p in TRAIN_IMG.glob("*.tif")) & \
+                set(int(p.stem) for p in TRAIN_LBL.glob("*.tif"))
+    train_df = train_df[train_df.id.isin(available)]
+
+    val_ids = train_df[train_df.scroll_id == VAL_SCROLL].id.tolist()
+    train_ids = train_df[train_df.scroll_id != VAL_SCROLL].id.tolist()
+
+    if args.dry_run:
+        train_ids = train_ids[:5]
+        val_ids = val_ids[:2]
+
+    print(f"Train: {len(train_ids)} volumes, Val: {len(val_ids)} volumes")
+
+    # ── DataLoaders ──
+    train_ds = VesuviusPatchDataset(train_ids, train=True)
+    val_ds = VesuviusPatchDataset(val_ids, train=False)
+
+    train_loader = DataLoader(
+        train_ds, batch_size=1, shuffle=True, num_workers=2,
+        collate_fn=collate_fn, pin_memory=False,
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=1, shuffle=False, num_workers=0,
+        collate_fn=collate_fn, pin_memory=False,
+    )
+
+    # ── Model ──
+    print(f"Loading TransUNet from {args.weights}")
+    model = TransUNet(
+        input_shape=(160, 160, 160, 1),
+        encoder_name='seresnext50',
+        classifier_activation='softmax',
+        num_classes=3,
+    )
+    model.load_weights(str(args.weights))
+    print(f"Model params: {model.count_params() / 1e6:.1f}M")
+
+    # ── Training setup ──
+    total_steps = len(train_loader) * args.epochs
+    lr_schedule = keras.optimizers.schedules.CosineDecay(
+        initial_learning_rate=args.lr,
+        decay_steps=total_steps,
+        alpha=0.1,  # min LR = lr * 0.1
+    )
+
+    optimizer = keras.optimizers.AdamW(
+        learning_rate=lr_schedule,
+        weight_decay=args.weight_decay,
+    )
+
+    loss_fn = build_loss(w_srec=args.skel_weight, w_fp=args.fp_weight,
+                         w_dist=args.dist_weight)
+
+    # Note: gradient_accumulation_steps in Keras 3 optimizer
+    if args.grad_accum > 1:
+        optimizer.gradient_accumulation_steps = args.grad_accum
+        print(f"Gradient accumulation: {args.grad_accum} steps")
+
+    model.compile(
+        optimizer=optimizer,
+        loss=loss_fn,
+    )
+
+    print(f"\nTraining config:")
+    print(f"  LR: {args.lr} → {args.lr * 0.1} (cosine decay)")
+    print(f"  Weight decay: {args.weight_decay}")
+    print(f"  Epochs: {args.epochs}")
+    print(f"  Effective batch size: {args.grad_accum}")
+    print(f"  Steps/epoch: {len(train_loader)}")
+    print(f"  Total steps: {total_steps}")
+    print(f"  Loss weights: skel={args.skel_weight}, fp={args.fp_weight}, dist={args.dist_weight}")
+    print(f"  Checkpoint dir: {ckpt_dir}")
+
+    # ── Training loop ──
+    # Manual loop for better control over checkpointing and logging
+    best_loss = float('inf')
+    t_start = time.time()
+
+    for epoch in range(args.epochs):
+        t_epoch = time.time()
+        train_losses = []
+
+        # Training
+        model.trainable = True
+        for step, (x_batch, y_batch) in enumerate(train_loader):
+            loss_val = model.train_on_batch(x_batch, y_batch)
+            if isinstance(loss_val, (list, tuple)):
+                loss_val = loss_val[0]
+            train_losses.append(float(loss_val))
+
+            if (step + 1) % 50 == 0 or step == 0:
+                elapsed = time.time() - t_epoch
+                eta = elapsed / (step + 1) * (len(train_loader) - step - 1)
+                print(f"  Epoch {epoch+1}/{args.epochs} step {step+1}/{len(train_loader)}: "
+                      f"loss={np.mean(train_losses[-50:]):.4f} "
+                      f"({elapsed/60:.1f}min, ETA {eta/60:.1f}min)")
+
+        # Validation
+        val_losses = []
+        for x_val, y_val in val_loader:
+            vl = model.test_on_batch(x_val, y_val)
+            if isinstance(vl, (list, tuple)):
+                vl = vl[0]
+            val_losses.append(float(vl))
+
+        train_loss = np.mean(train_losses)
+        val_loss = np.mean(val_losses) if val_losses else float('nan')
+        epoch_time = time.time() - t_epoch
+
+        print(f"\nEpoch {epoch+1}/{args.epochs}: "
+              f"train_loss={train_loss:.4f}, val_loss={val_loss:.4f}, "
+              f"time={epoch_time/60:.1f}min")
+
+        # Save checkpoint every N epochs
+        if (epoch + 1) % args.save_every == 0:
+            ckpt_path = ckpt_dir / f"transunet_ep{epoch+1}.weights.h5"
+            model.save_weights(str(ckpt_path))
+            print(f"  Checkpoint saved: {ckpt_path}")
+
+        # Save best
+        if val_loss < best_loss:
+            best_loss = val_loss
+            best_path = ckpt_dir / "transunet_best.weights.h5"
+            model.save_weights(str(best_path))
+            print(f"  New best model saved: {best_path} (val_loss={val_loss:.4f})")
+
+    total_time = time.time() - t_start
+    print(f"\n{'='*60}")
+    print(f"Training complete: {total_time/3600:.1f} hours")
+    print(f"Best val_loss: {best_loss:.4f}")
+    print(f"Checkpoints: {ckpt_dir}")
+    print(f"{'='*60}")
+
+
+if __name__ == '__main__':
+    main()

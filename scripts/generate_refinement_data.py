@@ -15,6 +15,11 @@ Usage:
     # With checkpoint (needs MONAI):
     python scripts/generate_refinement_data.py \
         --checkpoint checkpoints/models/best_segresnet_v9.pth --tta
+
+    # With 3-class model (v13):
+    python scripts/generate_refinement_data.py \
+        --checkpoint checkpoints/models/segresnet_v13_ep15.pth --tta --three-class \
+        --output-dir data/refinement_data/probmaps_v13
 """
 import argparse
 import time
@@ -22,13 +27,14 @@ import numpy as np
 import pandas as pd
 import tifffile
 import torch
+import torch.nn.functional as F
 from pathlib import Path
 
 # ── Config ────────────────────────────────────────────────
 ROOT = Path("/workspace/vesuvius-kaggle-competition")
 TRAIN_IMG = ROOT / "data" / "train_images"
 TRAIN_LBL = ROOT / "data" / "train_labels"
-OUTPUT_DIR = ROOT / "data" / "refinement_data" / "probmaps"
+DEFAULT_OUTPUT_DIR = ROOT / "data" / "refinement_data" / "probmaps"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 PATCH_SIZE = 160
@@ -36,7 +42,7 @@ STRIDE = 80
 
 
 # ── Model loading ─────────────────────────────────────────
-def load_model(checkpoint_path=None, traced_path=None):
+def load_model(checkpoint_path=None, traced_path=None, out_channels=1):
     """Load model from traced .pt (preferred) or fastai checkpoint."""
     if traced_path:
         model = torch.jit.load(traced_path, map_location=DEVICE)
@@ -45,7 +51,7 @@ def load_model(checkpoint_path=None, traced_path=None):
 
     from monai.networks.nets import SegResNet
     model = SegResNet(
-        spatial_dims=3, in_channels=1, out_channels=1,
+        spatial_dims=3, in_channels=1, out_channels=out_channels,
         init_filters=16, blocks_down=[1, 2, 2, 4], blocks_up=[1, 1, 1],
         dropout_prob=0.2,
     )
@@ -80,12 +86,12 @@ def _positions(length, ps, stride):
 
 
 # ── Gaussian SWI (logit space) ────────────────────────────
-def swi_gaussian(model, volume):
-    """Gaussian-weighted sliding window, returns raw logits."""
+def swi_gaussian(model, volume, out_channels=1):
+    """Gaussian-weighted sliding window, returns raw logits (C, D, H, W)."""
     D, H, W = volume.shape
     ps = PATCH_SIZE
     gauss = GAUSSIAN_MAP
-    output = np.zeros((D, H, W), dtype=np.float32)
+    output = np.zeros((out_channels, D, H, W), dtype=np.float32)
     weights = np.zeros((D, H, W), dtype=np.float32)
 
     z_pos = _positions(D, ps, STRIDE)
@@ -98,26 +104,46 @@ def swi_gaussian(model, volume):
                 for x in x_pos:
                     patch = volume[z:z+ps, y:y+ps, x:x+ps]
                     patch_t = torch.from_numpy(patch).float().unsqueeze(0).unsqueeze(0).to(DEVICE) / 255.0
-                    logits = model(patch_t).squeeze().cpu().numpy()
-                    output[z:z+ps, y:y+ps, x:x+ps] += logits * gauss
+                    logits = model(patch_t).squeeze(0).cpu().numpy()  # (C, D, H, W) or (D, H, W)
+                    if out_channels == 1:
+                        if logits.ndim == 4:
+                            logits = logits[0]
+                        output[0, z:z+ps, y:y+ps, x:x+ps] += logits * gauss
+                    else:
+                        for c in range(out_channels):
+                            output[c, z:z+ps, y:y+ps, x:x+ps] += logits[c] * gauss
                     weights[z:z+ps, y:y+ps, x:x+ps] += gauss
-    return output / weights  # raw logits
+    for c in range(out_channels):
+        output[c] /= weights
+    return output  # raw logits (C, D, H, W)
+
+
+def logits_to_prob(logits, three_class=False):
+    """Convert logits (C, D, H, W) to foreground probability map (D, H, W)."""
+    if three_class:
+        logits_t = torch.from_numpy(logits).unsqueeze(0)  # (1, 3, D, H, W)
+        probs = F.softmax(logits_t, dim=1).squeeze(0).numpy()  # (3, D, H, W)
+        return probs[1]  # class 1 = foreground
+    else:
+        return 1.0 / (1.0 + np.exp(-logits[0]))
 
 
 # ── TTA: logit-space averaging ────────────────────────────
-def tta_logit(model, volume):
-    """Average logits across 7 augmentations, then sigmoid."""
-    logits_sum = swi_gaussian(model, volume).astype(np.float64)
+def tta_logit(model, volume, out_channels=1, three_class=False):
+    """Average logits across 7 augmentations, then convert to probability."""
+    logits_sum = swi_gaussian(model, volume, out_channels).astype(np.float64)
     for axis in range(3):
         flipped = np.flip(volume, axis=axis).copy()
-        l = swi_gaussian(model, flipped)
-        logits_sum += np.flip(l, axis=axis)
+        l = swi_gaussian(model, flipped, out_channels)
+        for c in range(out_channels):
+            logits_sum[c] += np.flip(l[c], axis=axis)
     for k in [1, 2, 3]:
         rotated = np.rot90(volume, k=k, axes=(1, 2)).copy()
-        l = swi_gaussian(model, rotated)
-        logits_sum += np.rot90(l, k=-k, axes=(1, 2))
+        l = swi_gaussian(model, rotated, out_channels)
+        for c in range(out_channels):
+            logits_sum[c] += np.rot90(l[c], k=-k, axes=(1, 2))
     mean_logits = (logits_sum / 7.0).astype(np.float32)
-    return 1.0 / (1.0 + np.exp(-mean_logits))
+    return logits_to_prob(mean_logits, three_class)
 
 
 def main():
@@ -126,13 +152,23 @@ def main():
     group.add_argument("--checkpoint", help="Path to fastai model checkpoint (.pth)")
     group.add_argument("--traced", help="Path to traced model (.pt)")
     parser.add_argument("--tta", action="store_true", help="Use 7-fold TTA (7x slower)")
+    parser.add_argument("--three-class", action="store_true",
+                        help="3-class model (v13): use softmax + extract class-1 prob")
+    parser.add_argument("--output-dir", type=str, default=None,
+                        help="Override output directory (default: data/refinement_data/probmaps)")
     args = parser.parse_args()
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    out_channels = 3 if args.three_class else 1
+    output_dir = Path(args.output_dir) if args.output_dir else DEFAULT_OUTPUT_DIR
+    if not output_dir.is_absolute():
+        output_dir = ROOT / output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     src = args.traced or args.checkpoint
     print(f"Loading model from {src}")
-    model = load_model(checkpoint_path=args.checkpoint, traced_path=args.traced)
+    print(f"  out_channels={out_channels}, three_class={args.three_class}")
+    model = load_model(checkpoint_path=args.checkpoint, traced_path=args.traced,
+                       out_channels=out_channels)
 
     # Get all training volume IDs that have files on disk
     train_df = pd.read_csv(ROOT / "data" / "train.csv")
@@ -140,10 +176,10 @@ def main():
     vol_ids = sorted(train_df[train_df.id.isin(available_ids)].id.tolist())
 
     # Skip already-generated volumes (for resumability)
-    remaining = [vid for vid in vol_ids if not (OUTPUT_DIR / f"{vid}.npy").exists()]
+    remaining = [vid for vid in vol_ids if not (output_dir / f"{vid}.npy").exists()]
     print(f"Total volumes: {len(vol_ids)}, already done: {len(vol_ids) - len(remaining)}, remaining: {len(remaining)}")
     print(f"Mode: {'Gaussian SWI + logit TTA (7-fold)' if args.tta else 'Gaussian SWI only'}")
-    print(f"Output: {OUTPUT_DIR}")
+    print(f"Output: {output_dir}")
     print()
 
     t_total = time.time()
@@ -152,13 +188,14 @@ def main():
         img = tifffile.imread(TRAIN_IMG / f"{vid}.tif")
 
         if args.tta:
-            prob = tta_logit(model, img)
+            prob = tta_logit(model, img, out_channels=out_channels,
+                             three_class=args.three_class)
         else:
-            logits = swi_gaussian(model, img)
-            prob = 1.0 / (1.0 + np.exp(-logits))  # sigmoid
+            logits = swi_gaussian(model, img, out_channels=out_channels)
+            prob = logits_to_prob(logits, three_class=args.three_class)
 
         # Save as float16 to save space (~65 MB vs 130 MB per volume)
-        np.save(OUTPUT_DIR / f"{vid}.npy", prob.astype(np.float16))
+        np.save(output_dir / f"{vid}.npy", prob.astype(np.float16))
 
         elapsed = time.time() - t0
         total_elapsed = time.time() - t_total
@@ -168,9 +205,9 @@ def main():
               f"(avg {avg:.1f}s, ETA {eta/60:.0f}min)")
 
     total_time = time.time() - t_total
-    total_size = sum(f.stat().st_size for f in OUTPUT_DIR.glob("*.npy")) / 1e9
+    total_size = sum(f.stat().st_size for f in output_dir.glob("*.npy")) / 1e9
     print(f"\nDone! {len(vol_ids)} volumes in {total_time/60:.1f} min")
-    print(f"Total size: {total_size:.1f} GB at {OUTPUT_DIR}")
+    print(f"Total size: {total_size:.1f} GB at {output_dir}")
 
 
 if __name__ == "__main__":
