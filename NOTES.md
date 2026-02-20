@@ -225,11 +225,28 @@ After the overnight low-LR runs, restart gpu1/gpu2 with more storage. New experi
 Both use skel=0.75, fp=1.5 loss config. PyTorch optimizer with parameter groups for
 discriminative LR. Scripts include dry-run + training + eval (same pipeline as variants).
 
-**Also prepared: SWA weight averaging** (`scripts/swa_average.py`)
-- Averages weights from multiple checkpoints (model soup)
-- Can interpolate between pretrained and fine-tuned (e.g., 70/30 mix)
-- Zero-cost experiment on existing checkpoints — needs eval pass to score
-- Will try after overnight runs complete and GPU is free
+**SWA weight averaging results (Feb 20)**
+
+First approach to beat pretrained! Blending pretrained + fine-tuned weights at 70/30 ratio.
+
+| Model | Comp | Topo | SDice | VOI | n |
+|-------|------|------|-------|-----|---|
+| pretrained (baseline) | 0.5526 | 0.2354 | 0.8255 | 0.5517 | 24 |
+| **swa_70pre_30distsq_ep5** | **0.5530** | **0.2462** | 0.8289 | 0.5401 | 24 |
+| swa_70pre_30lowlr_ep5 | 0.5518 | 0.2367 | 0.8296 | 0.5440 | 24 |
+| swa_50pre_50lowlr_ep5 | 0.5518 | 0.2467 | 0.8272 | 0.5378 | 24 |
+| swa_lowlr_late_avg | 0.5243 | 0.2276 | 0.7785 | 0.5244 | 24 |
+
+Key insights:
+- 70/30 pretrained+dist_sq_ep5 blend marginally beats pretrained on all 3 sub-metrics
+- 50/50 blend has strongest topo improvement (+0.011) with minimal SDice loss
+- Pure fine-tuned average (lowlr_late_avg) is much worse — pretrained weights carry most value
+- This validates the model soup approach: fine-tuning learns useful signal, but only
+  a small dose (30%) improves on pretrained without degrading SDice
+- Next: try SWA blends with discrim_dist_sq and frozen_dist_sq when those complete
+
+Results: `logs/eval_swa_results.csv`
+Weights: `checkpoints/swa/`
 
 ### v21 submitted — scored 0.504
 

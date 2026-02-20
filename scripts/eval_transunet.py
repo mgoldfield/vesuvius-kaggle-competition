@@ -243,6 +243,8 @@ def main():
     parser.add_argument('--max-per-scroll', type=int, default=5)
     parser.add_argument('--save-probmaps', action='store_true',
                         help='Save probmaps to disk for reuse')
+    parser.add_argument('--probmap-dir', type=str, default=None,
+                        help='Custom probmap output directory (default: data/transunet_probmaps)')
     parser.add_argument('--t-low', type=float, default=0.50)
     parser.add_argument('--t-high', type=float, default=0.90)
     args = parser.parse_args()
@@ -281,8 +283,9 @@ def main():
         print(f"Val eval (scroll {VAL_SCROLL}): {len(eval_ids)} volumes")
 
     # Probmap output dir
+    probmap_dir = Path(args.probmap_dir) if args.probmap_dir else PROBMAP_DIR
     if args.save_probmaps:
-        PROBMAP_DIR.mkdir(parents=True, exist_ok=True)
+        probmap_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"\nConfig: overlap={args.overlap}, TTA={args.tta}, "
           f"T_low={args.t_low}, T_high={args.t_high}, ds={args.downsample}")
@@ -316,7 +319,7 @@ def main():
 
         # Save probmap
         if args.save_probmaps:
-            np.save(PROBMAP_DIR / f"{vid}.npy", prob.astype(np.float16))
+            np.save(probmap_dir / f"{vid}.npy", prob.astype(np.float16))
 
         # Post-process and score
         pred = postprocess(prob, t_low=args.t_low, t_high=args.t_high)
