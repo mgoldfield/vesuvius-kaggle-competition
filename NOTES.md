@@ -33,6 +33,11 @@ All share the same training data, pretrained weights, scripts, and venv.
 - Each GPU needs its own venv install or the shared venv must be accessible
 - See INSTALLATION.md for full reinstall instructions.
 - **Storage:** ~55 GB needed per GPU (25 GB data + 17 GB venv + 4 GB weights + 7 GB checkpoints + headroom)
+- **I/O contention warning:** Remote GPUs read training data over the network, causing
+  epoch time spikes of 3-7x when multiple GPUs train simultaneously (gpu0 ~10 min/epoch
+  vs gpu1 15-113 min/epoch). Local disks are only ~20 GB so data can't be copied locally.
+  For future setups, prefer machines with enough local storage to copy the training data
+  (~25 GB), or stagger training starts to reduce concurrent reads.
 
 ## Current Best: Run 9 (v9)
 - **Architecture:** MONAI SegResNet, 4.7M params, SuPreM pretrained weights
@@ -207,6 +212,24 @@ gentler fine-tuning. GPU1 also chains a `baseline_lowlr` run after thin_fp_lowlr
 ```bash
 for f in logs/eval_*_results.csv; do echo "=== $f ==="; cat "$f"; echo; done
 ```
+
+### Phase 3: Novel training approaches (Feb 20, after GPU restart)
+
+After the overnight low-LR runs, restart gpu1/gpu2 with more storage. New experiments:
+
+| GPU | Experiment | Script | Key Idea |
+|-----|-----------|--------|----------|
+| gpu1 | Discriminative LR | `scripts/launch_gpu1_discrim.sh` | enc=lr/100, vit=lr/10, dec=lr/10, head=lr. Preserves encoder features. |
+| gpu2 | Frozen encoder | `scripts/launch_gpu2_frozen.sh` | Freeze SEResNeXt50+ViT, only train decoder+head. Zero encoder degradation risk. |
+
+Both use skel=0.75, fp=1.5 loss config. PyTorch optimizer with parameter groups for
+discriminative LR. Scripts include dry-run + training + eval (same pipeline as variants).
+
+**Also prepared: SWA weight averaging** (`scripts/swa_average.py`)
+- Averages weights from multiple checkpoints (model soup)
+- Can interpolate between pretrained and fine-tuned (e.g., 70/30 mix)
+- Zero-cost experiment on existing checkpoints — needs eval pass to score
+- Will try after overnight runs complete and GPU is free
 
 ### v21 submitted — scored 0.504
 
@@ -501,6 +524,20 @@ To reach top 10 (0.57-0.60+), we need novel approaches beyond what's publicly sh
 - [~] **Fine-tune variants (overnight)** — 3 GPUs running: thin_fp (gpu1), dist_skel (gpu2), dist_sq (gpu0, pending).
 
 ### Not started
+- [ ] **SDice recovery for thinned models** — Fine-tuning improves VOI (0.5517→0.5281)
+  but destroys SDice (0.8255→0.7873). Theory: the thinner predictions are *better* but
+  lose surface boundary alignment. Two-pronged fix:
+  1. **Loss function tweaks** — Add explicit surface-alignment term (boundary loss,
+     surface dice proxy) to preserve SDice while keeping the VOI improvement from thinning.
+  2. **Post-processing** — Morphological dilation or surface-aware expansion of thinned
+     predictions to recover boundary coverage without re-thickening the interior.
+  If we can keep the VOI gain and recover even half the SDice loss, that's a net win.
+- [ ] **Discriminative LR training** — Script ready (`launch_gpu1_discrim.sh`). Enc=lr/100,
+  dec=lr/10, head=lr. Preserves encoder features that drive SDice.
+- [ ] **Frozen encoder training** — Script ready (`launch_gpu2_frozen.sh`). Zero encoder
+  degradation risk, only adapts decoder+head.
+- [ ] **SWA weight averaging** — Script ready (`swa_average.py`). Average pretrained +
+  fine-tuned weights. Zero-cost experiment on existing checkpoints.
 - [ ] **Component-level refinement** — Novel learned post-processing targeting VOI.
 - [ ] **Pseudo-labeling** — Retrain with soft labels on unlabeled regions.
 - [ ] **Ensemble** — Fine-tuned + pretrained TransUNet logit averaging.

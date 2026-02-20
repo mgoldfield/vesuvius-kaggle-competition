@@ -295,6 +295,10 @@ def main():
                         help='Distance-from-skeleton loss weight (0=disabled)')
     parser.add_argument('--dist-power', type=float, default=1.0,
                         help='Power for distance term (1=linear, 2=quadratic)')
+    parser.add_argument('--freeze-encoder', action='store_true',
+                        help='Freeze CNN encoder (SEResNeXt50), only train decoder + head')
+    parser.add_argument('--discriminative-lr', action='store_true',
+                        help='Use per-layer-group LRs: encoder=lr/100, decoder=lr/10, head=lr')
     args = parser.parse_args()
 
     if args.dry_run:
@@ -354,40 +358,108 @@ def main():
     model.load_weights(str(args.weights))
     print(f"Model params: {model.count_params() / 1e6:.1f}M")
 
+    # ── Freeze encoder if requested ──
+    if args.freeze_encoder:
+        n_frozen = 0
+        for layer in model.layers:
+            name = layer.name
+            if (name.startswith(('conv1', 'pool1', 'stack'))
+                    or name.startswith('transunet_vit')):
+                layer.trainable = False
+                n_frozen += 1
+        trainable_params = sum(
+            np.prod(v.shape) for v in model.trainable_weights
+        )
+        print(f"Frozen encoder: {n_frozen} layers frozen, "
+              f"{trainable_params / 1e6:.1f}M trainable params remaining")
+
     # ── Training setup ──
+    use_torch_optim = args.discriminative_lr
+
     total_steps = len(train_loader) * args.epochs
-    lr_schedule = keras.optimizers.schedules.CosineDecay(
-        initial_learning_rate=args.lr,
-        decay_steps=total_steps,
-        alpha=0.1,  # min LR = lr * 0.1
-    )
-
-    optimizer = keras.optimizers.AdamW(
-        learning_rate=lr_schedule,
-        weight_decay=args.weight_decay,
-    )
-
     loss_fn = build_loss(w_srec=args.skel_weight, w_fp=args.fp_weight,
                          w_dist=args.dist_weight, dist_power=args.dist_power)
 
-    # Note: gradient_accumulation_steps in Keras 3 optimizer
-    if args.grad_accum > 1:
-        optimizer.gradient_accumulation_steps = args.grad_accum
-        print(f"Gradient accumulation: {args.grad_accum} steps")
+    if use_torch_optim:
+        # Discriminative LR: use PyTorch optimizer with parameter groups.
+        # encoder=lr/100, vit=lr/10, decoder=lr/10, head=lr
+        enc_params, vit_params, dec_params, head_params = [], [], [], []
+        for var in model.trainable_weights:
+            name = var.name
+            tensor = var.value  # underlying torch tensor
+            if name.startswith(('conv1', 'pool1', 'stack')):
+                enc_params.append(tensor)
+            elif name.startswith('transunet_vit'):
+                vit_params.append(tensor)
+            elif name.startswith('final_conv'):
+                head_params.append(tensor)
+            else:
+                dec_params.append(tensor)
 
-    model.compile(
-        optimizer=optimizer,
-        loss=loss_fn,
-    )
+        lr_enc = args.lr / 100   # e.g., 5e-7 for lr=5e-5
+        lr_vit = args.lr / 10    # e.g., 5e-6
+        lr_dec = args.lr / 10    # e.g., 5e-6
+        lr_head = args.lr        # e.g., 5e-5
+
+        param_groups = []
+        if enc_params:
+            param_groups.append({'params': enc_params, 'lr': lr_enc})
+        if vit_params:
+            param_groups.append({'params': vit_params, 'lr': lr_vit})
+        if dec_params:
+            param_groups.append({'params': dec_params, 'lr': lr_dec})
+        if head_params:
+            param_groups.append({'params': head_params, 'lr': lr_head})
+
+        torch_optimizer = torch.optim.AdamW(
+            param_groups, weight_decay=args.weight_decay
+        )
+
+        # Cosine decay scheduler for PyTorch
+        torch_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            torch_optimizer,
+            T_max=total_steps // args.grad_accum,  # total optimizer steps
+            eta_min=args.lr * 0.1 / 100,  # min LR for slowest group
+        )
+
+        print(f"\nDiscriminative LR (PyTorch optimizer):")
+        print(f"  Encoder: {lr_enc:.1e} ({len(enc_params)} tensors)")
+        print(f"  ViT:     {lr_vit:.1e} ({len(vit_params)} tensors)")
+        print(f"  Decoder: {lr_dec:.1e} ({len(dec_params)} tensors)")
+        print(f"  Head:    {lr_head:.1e} ({len(head_params)} tensors)")
+    else:
+        # Standard Keras optimizer
+        lr_schedule = keras.optimizers.schedules.CosineDecay(
+            initial_learning_rate=args.lr,
+            decay_steps=total_steps,
+            alpha=0.1,  # min LR = lr * 0.1
+        )
+
+        optimizer = keras.optimizers.AdamW(
+            learning_rate=lr_schedule,
+            weight_decay=args.weight_decay,
+        )
+
+        # Note: gradient_accumulation_steps in Keras 3 optimizer
+        if args.grad_accum > 1:
+            optimizer.gradient_accumulation_steps = args.grad_accum
+            print(f"Gradient accumulation: {args.grad_accum} steps")
+
+        model.compile(
+            optimizer=optimizer,
+            loss=loss_fn,
+        )
 
     print(f"\nTraining config:")
-    print(f"  LR: {args.lr} → {args.lr * 0.1} (cosine decay)")
+    print(f"  LR: {args.lr}" + (" (discriminative)" if use_torch_optim else
+          f" → {args.lr * 0.1} (cosine decay)"))
     print(f"  Weight decay: {args.weight_decay}")
     print(f"  Epochs: {args.epochs}")
     print(f"  Effective batch size: {args.grad_accum}")
     print(f"  Steps/epoch: {len(train_loader)}")
     print(f"  Total steps: {total_steps}")
     print(f"  Loss weights: skel={args.skel_weight}, fp={args.fp_weight}, dist={args.dist_weight}, dist_power={args.dist_power}")
+    print(f"  Freeze encoder: {args.freeze_encoder}")
     print(f"  Checkpoint dir: {ckpt_dir}")
 
     # ── Training loop ──
@@ -395,16 +467,42 @@ def main():
     best_loss = float('inf')
     t_start = time.time()
 
+    # Enable mixed precision context for PyTorch manual loop
+    amp_ctx = torch.amp.autocast('cuda', dtype=torch.bfloat16) if use_torch_optim else None
+
     for epoch in range(args.epochs):
         t_epoch = time.time()
         train_losses = []
 
-        # Training
-        model.trainable = True
+        # Training (don't reset trainable if encoder is frozen)
+        if not args.freeze_encoder:
+            model.trainable = True
+        if use_torch_optim:
+            torch_optimizer.zero_grad()
+
         for step, (x_batch, y_batch) in enumerate(train_loader):
-            loss_val = model.train_on_batch(x_batch, y_batch)
-            if isinstance(loss_val, (list, tuple)):
-                loss_val = loss_val[0]
+            if use_torch_optim:
+                # Manual PyTorch training step for discriminative LR
+                x_t = torch.tensor(x_batch, device='cuda')
+                y_t = torch.tensor(y_batch, device='cuda')
+                with amp_ctx:
+                    y_pred = model(x_t, training=True)
+                    loss = loss_fn(y_t, y_pred)
+                    loss_scaled = loss / args.grad_accum
+                loss_scaled.backward()
+
+                if (step + 1) % args.grad_accum == 0:
+                    torch_optimizer.step()
+                    torch_scheduler.step()
+                    torch_optimizer.zero_grad()
+
+                loss_val = float(loss.detach().cpu())
+                del x_t, y_t, y_pred, loss, loss_scaled
+            else:
+                loss_val = model.train_on_batch(x_batch, y_batch)
+                if isinstance(loss_val, (list, tuple)):
+                    loss_val = loss_val[0]
+
             train_losses.append(float(loss_val))
 
             if (step + 1) % 50 == 0 or step == 0:
@@ -414,13 +512,28 @@ def main():
                       f"loss={np.mean(train_losses[-50:]):.4f} "
                       f"({elapsed/60:.1f}min, ETA {eta/60:.1f}min)")
 
+        # Flush any remaining accumulated gradients
+        if use_torch_optim and len(train_loader) % args.grad_accum != 0:
+            torch_optimizer.step()
+            torch_scheduler.step()
+            torch_optimizer.zero_grad()
+
         # Validation
         val_losses = []
-        for x_val, y_val in val_loader:
-            vl = model.test_on_batch(x_val, y_val)
-            if isinstance(vl, (list, tuple)):
-                vl = vl[0]
-            val_losses.append(float(vl))
+        with torch.no_grad():
+            for x_val, y_val in val_loader:
+                if use_torch_optim:
+                    x_t = torch.tensor(x_val, device='cuda')
+                    y_t = torch.tensor(y_val, device='cuda')
+                    with amp_ctx:
+                        y_pred = model(x_t, training=False)
+                        vl = float(loss_fn(y_t, y_pred).detach().cpu())
+                    del x_t, y_t, y_pred
+                else:
+                    vl = model.test_on_batch(x_val, y_val)
+                    if isinstance(vl, (list, tuple)):
+                        vl = vl[0]
+                val_losses.append(float(vl))
 
         train_loss = np.mean(train_losses)
         val_loss = np.mean(val_losses) if val_losses else float('nan')
