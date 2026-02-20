@@ -7,7 +7,7 @@ for active decision-making — keep this file lean.
 ## Competition
 - **Goal:** Detect papyrus surfaces in 3D CT scans of Herculaneum scrolls
 - **Metric:** `0.30*TopoScore + 0.35*SurfaceDice@tau=2 + 0.35*VOI_score`
-- **Deadline:** Feb 27, 2026 (11 days remaining)
+- **Deadline:** Feb 27, 2026 (8 days remaining)
 - **Submission:** Code competition — Kaggle notebook, GPU, ≤9hr, no internet
 - **Leaderboard:** 1,334 teams. Top score 0.607. Our best public: 0.504 (v20, TransUNet)
 - **Public test: only 1 volume** (ID 1407735). Scores are high-variance/unreliable.
@@ -18,9 +18,21 @@ for active decision-making — keep this file lean.
 - 6 scroll_ids: 34117 (382), 35360 (176), 26010 (130), 26002 (88), 44430 (17), 53997 (13)
 
 ## Hardware
-**Cloud GPU (current):** RTX 5090, persistent `/workspace/` volume.
+
+**3 GPUs sharing a network volume at `/workspace/`.**
+All share the same training data, pretrained weights, scripts, and venv.
+
+| Name | SSH | Role |
+|---|---|---|
+| **gpu0** (this machine) | local | baseline_v3 training + eval (DONE). Primary control. |
+| **gpu1** (A100 80GB) | `ssh -i ~/.ssh/remote-gpu root@213.173.105.5 -p 30038` | Overnight: thin_fp variant |
+| **gpu2** (A100 80GB) | `ssh -i ~/.ssh/remote-gpu root@213.173.105.5 -p 30228` | Overnight: dist_skel variant |
+
+- Shared network volume: `/workspace/` (data, weights, scripts, venv)
 - Venv: `/workspace/venv/`, bootstrap: `bash /workspace/start.sh`
+- Each GPU needs its own venv install or the shared venv must be accessible
 - See INSTALLATION.md for full reinstall instructions.
+- **Storage:** ~55 GB needed per GPU (25 GB data + 17 GB venv + 4 GB weights + 7 GB checkpoints + headroom)
 
 ## Current Best: Run 9 (v9)
 - **Architecture:** MONAI SegResNet, 4.7M params, SuPreM pretrained weights
@@ -42,6 +54,7 @@ for active decision-making — keep this file lean.
 | Run 10 | 0.584 | 0.267 | + attn gates + DS — peaked epoch 0 (LR issue) |
 | Run 12 | — | — | TRAINING: flat_cos + 50 epochs |
 | TransUNet pretrained | 0.510 (82v) | **0.504** | Comboloss weights, dual-stream, 7-TTA |
+| v21 | 0.510 (82v) | 0.504 | T_low=0.70 (same score — public test is 1 volume) |
 
 ## Key Insights (from 11 runs — details in HISTORY.md)
 1. **Inference pipeline > model architecture.** Gaussian SWI + logit TTA gave +0.19 comp_score
@@ -66,7 +79,177 @@ for active decision-making — keep this file lean.
     p90/p95/p99 percentile). All score identically at 0.5737. What matters is binary: T_HIGH
     below max prob → good; above → catastrophic. Fixed 0.75 is simplest and most robust.
 
-## Current Status (Feb 17 overnight → Feb 18 morning)
+## Current Status (Feb 19)
+
+### Critical bug found and fixed: Training normalization mismatch
+
+**Root cause of catastrophic fine-tuning degradation identified.**
+
+All previous fine-tuning runs (baseline, thin_fp, thin_dist, baseline_v2) degraded the
+model from comp=0.535 → 0.264-0.343. After extensive investigation, we found **two bugs**:
+
+**Bug 1 — Normalization mismatch (HIGH impact):**
+Our training used `/255` normalization (range [0,1]), but our eval pipeline and Kaggle
+inference use medicai's `NormalizeIntensity(nonzero=True)` — z-score normalization
+(subtract nonzero mean, divide by nonzero std; range ~[-4, +7], mean=0).
+
+The model learned to handle [0,1] input during training but was evaluated with z-score
+input. Head-to-head test on baseline_v2 (1 volume):
+```
+Z-score eval (wrong for /255-trained model): comp=0.2828
+/255 eval    (matching training):            comp=0.4506
+```
+Normalization alone accounts for most of the degradation.
+
+**Bug 2 — Intensity shift effectively zero (HIGH impact):**
+We "fixed" the intensity shift from `shift * 255` to `shift = uniform(-0.15, 0.15)`.
+But since augmentation runs on the 0-255 scale BEFORE normalization, a ±0.15 absolute
+shift on 0-255 data = ±0.0006 after /255 normalization = essentially zero augmentation.
+The original `* 255` was actually correct for /255 normalization (gives ±0.15 on 0-1
+scale after division). Now using ±0.10 in z-score space (matching competitor TPU
+notebook's RandShiftIntensity(offsets=0.10) applied after z-score normalization).
+
+**The fix (applied in baseline_v3):**
+1. Training now uses z-score normalization: compute mean/std of nonzero voxels from
+   the full volume, apply to patches. Matches eval pipeline and Kaggle notebook.
+2. Augmentation (including intensity shift) now operates in z-score space.
+3. Intensity shift is ±0.10 std devs (meaningful augmentation, not zero).
+
+### Pretrained model training chain (important context)
+
+The comboloss weights we fine-tune from were trained in two stages by different people:
+1. **Stage 1 (TPU, Innat):** ImageNet encoder → 200 epochs at 128^3 with
+   `NormalizeIntensity` (z-score) + DiceCE + clDice loss
+2. **Stage 2 (GPU, 0537 notebook):** Fine-tuned Stage 1 for 25 epochs at 160^3 with
+   `ScaleIntensityRange` (/255) + DiceCE + SkeletonRecall + FP_Volume loss
+
+The model has seen BOTH normalizations. Our eval uses z-score (matching Stage 1), so
+training should also use z-score for consistency.
+
+### Comprehensive training pipeline comparison (Feb 19)
+
+Compared our `train_transunet.py` against COMP-0537 (comboloss notebook) and COMP-TPU:
+
+| Difference | Risk | Status |
+|---|---|---|
+| Normalization: /255 vs z-score | **HIGH** | **FIXED** — now z-score |
+| Intensity shift: ~zero vs ±0.10 | **HIGH** | **FIXED** — now ±0.10 z-score |
+| Validation: patch loss vs full-vol SWI | MEDIUM | Mitigated by checkpoint eval sweep |
+| FG-biased sampling: 50% vs none | MEDIUM | Keeping — arguably better for short runs |
+| Effective batch: 4 vs 8 | MEDIUM | Keeping — minor difference |
+| Loss function | OK | Matches COMP-0537 exactly |
+| LR schedule (5e-5 cosine) | OK | Matches COMP-0537 exactly |
+| Optimizer (AdamW, wd=1e-5) | OK | Matches COMP-0537 exactly |
+| CutOut (6 blocks, 2-8 voxels) | OK | Matches COMP-0537 exactly |
+| Mixed precision (bfloat16) | OK | Matches TPU behavior |
+
+### Previous fine-tuning runs (ALL BROKEN — checkpoints deleted)
+
+All trained with wrong normalization (/255 instead of z-score). Checkpoints deleted
+(~135 GB freed). Results for reference only:
+
+| Run | Config | Val Loss | Comp Score | Issue |
+|---|---|---|---|---|
+| baseline (Run 1) | float16, shift*255, /255 norm | 1.04→0.97 | 0.304 | float16 underflow + wrong norm |
+| thin_fp (Run 2) | float16, shift*255, /255 norm | 1.18→1.12 | 0.343 | float16 underflow + wrong norm |
+| thin_dist (Run 3) | float16, shift*255, /255 norm | 1.23→1.20 | 0.288 | float16 underflow + wrong norm + OOM |
+| baseline_v2 | bfloat16, shift~0, /255 norm | 1.05→1.00 | 0.264 (z-score eval) / 0.45 (/255 eval) | Wrong norm |
+
+### baseline_v3 eval results (PARTIAL — Feb 19 evening)
+
+Training completed (25 epochs, ~4.5h). Evaluation of all checkpoints in progress.
+No catastrophic degradation — normalization fix worked! But not yet beating pretrained.
+
+| Model | Comp | Topo | SDice | VOI |
+|-------|------|------|-------|-----|
+| pretrained | **0.5526** | **0.2353** | **0.8254** | 0.5517 |
+| ep5 | 0.5361 | 0.2148 | 0.7945 | 0.5532 |
+| ep10 | 0.5269 | 0.1961 | 0.7811 | **0.5562** |
+| ep15 | 0.5240 | 0.1901 | 0.7856 | 0.5487 |
+| ep20 | 0.5300 | 0.2057 | 0.7915 | 0.5463 |
+| ep25 | 0.5296 | 0.2045 | 0.7879 | 0.5499 |
+| best | 0.5296 | 0.2045 | 0.7879 | 0.5499 |
+
+**Conclusion:** Fine-tuning with correct normalization doesn't catastrophically degrade (was 0.264
+before fix), but none of the checkpoints beat pretrained (0.5526). The loss variants (thin_fp,
+dist_skel, dist_sq) may perform differently with their adjusted loss weights.
+
+Full results: `logs/eval_v3_results.csv`
+Script: `scripts/train_and_eval_v3.sh`
+
+### Overnight training (Feb 19-20) — 3 GPU sweep
+
+All use z-score normalization, 25 epochs, checkpoints every 5, auto-eval after training.
+Script: `scripts/train_and_eval_variant.sh`
+
+| GPU | Variant | Loss Config | Log File | Status |
+|-----|---------|-------------|----------|--------|
+| gpu0 | dist_sq | skel=0.75, fp=1.5, dist=2.0, power=2.0 | `logs/train_eval_dist_sq.log` | Dry run → training |
+| gpu1 | thin_fp | skel=0.75, fp=1.5, dist=0.0, power=1.0 | `logs/train_eval_thin_fp.log` | Dry run → training |
+| gpu2 | dist_skel | skel=0.75, fp=1.5, dist=1.0, power=1.0 | `logs/train_eval_dist_skel.log` | Training in progress |
+
+Results will be in `logs/eval_<variant>_results.csv`. Expected ~4.5h training + ~3h eval per GPU.
+
+**Phase 2: Low-LR follow-ups (auto-chained)**
+
+After each variant finishes, a `chain_lowlr.sh` script auto-launches a low-LR (5e-6)
+version of the same variant. Tests hypothesis that the pretrained model just needs
+gentler fine-tuning. GPU1 also chains a `baseline_lowlr` run after thin_fp_lowlr.
+
+| GPU | Follow-up | Config | Expected Start (EST) |
+|-----|-----------|--------|---------------------|
+| gpu0 | dist_sq_lowlr | same + lr=5e-6 | ~5:30 AM |
+| gpu1 | thin_fp_lowlr | same + lr=5e-6 | ~4:00 AM |
+| gpu1 | baseline_lowlr | skel=0.75, fp=0.50, lr=5e-6 | after thin_fp_lowlr |
+| gpu2 | dist_skel_lowlr | same + lr=5e-6 | ~7:30 AM |
+
+**To check all overnight results when back:**
+```bash
+for f in logs/eval_*_results.csv; do echo "=== $f ==="; cat "$f"; echo; done
+```
+
+### v21 submitted — scored 0.504
+
+Same as v20 (expected — public test is only 1 volume). T_low=0.70 update.
+
+### Disk cleanup (Feb 19)
+
+Deleted ~135 GB of broken checkpoints and abandoned refinement data:
+- `data/refinement_data/` (94 GB) — abandoned approach
+- `checkpoints/transunet/` (13 GB), `transunet_thin_fp/` (11 GB),
+  `transunet_thin_dist/` (11 GB) — all float16 + wrong norm
+- `checkpoints/transunet_baseline_v2/` (5.3 GB) — wrong norm
+- Various empty checkpoint dirs
+
+Kept: `data/transunet_probmaps/` (6.5 GB, useful for PP sweeps),
+`checkpoints/models/` (1.2 GB, old SegResNet).
+
+## Key Insights (addendum)
+
+11. **Training and eval normalization MUST match.** The pretrained model works with
+    both /255 and z-score (due to its two-stage training history), but fine-tuning
+    with /255 pushes the model away from z-score compatibility. Since eval and Kaggle
+    use z-score (NormalizeIntensity), training must also use z-score. This caused all
+    our first fine-tuning attempts to appear to catastrophically degrade (comp 0.535 →
+    0.264), when the model was actually learning fine — just evaluated with wrong input.
+12. **Val loss can decrease while comp score collapses.** If training and eval use
+    different normalization, the model "learns" (lower loss on training's normalization)
+    but fails at eval (different normalization). Always verify training/eval pipelines
+    match end-to-end.
+
+## Previous Status (Feb 18)
+
+### v21 pushed and scored (T_low=0.70)
+Updated vesuvius-inference.py with T_low=0.70 (was 0.50). Scored 0.504 (same as v20 —
+expected since public test is only 1 volume).
+
+### Adaptive T_low analysis (COMPLETED)
+Swept 11 T_low values (0.30-0.80) on 20 cross-scroll volumes. Results:
+- Best fixed T_low=0.70 (comp=0.5324), NOT 0.60 (comp=0.5267) as 82-vol val suggested
+- Adaptive T_low not worthwhile: correlations too weak (best r=-0.539), benefit tiny
+- Results in `logs/adaptive_tlow_analysis.csv`
+
+## Previous Status (Feb 17 overnight → Feb 18 morning)
 
 ### Kaggle TransUNet submission: v20 scored 0.504 (up from 0.431)
 
@@ -118,7 +301,9 @@ competitor_default        0.5103 0.1997 0.7044 0.5823  (= tlow_0.5)
 our_old_defaults          0.4940 0.1907 0.6551 0.5928
 tlow_0.3                  0.4892 0.1901 0.6307 0.6041  ← WORST
 ```
-Key: T_low=0.6 is clearly best. T_high barely matters (0.75-0.95 all ~same).
+Key: T_low=0.6 best in 82-vol val sweep. BUT cross-scroll 20-vol T_low analysis
+(scripts/analyze_adaptive_tlow.py) shows T_low=0.70 is actually optimal (comp=0.5324
+vs 0.5267 at 0.60). v21 uses T_low=0.70. T_high barely matters (0.75-0.95 all ~same).
 Closing/dust/confidence filtering had minimal impact.
 
 **Phase 6 (Exploration):** COMPLETED. Notebook executed successfully.
@@ -180,21 +365,15 @@ dual-stream inference, seeded hysteresis. Pretrained model gets 0.545 LB out of 
 | Recommended | bs=1 + grad_accum=4 | Simulates bs=4, 21.26 GB |
 | Est. 10 epochs | ~0.8 hours | Per benchmark |
 
-### What to do when you wake up (Feb 18)
+### What to do when baseline_v3 finishes (Feb 19)
 
-1. **Push v21 with T_low=0.6** — Sweep shows T_low=0.6 is best (0.5179 vs 0.5103 default).
-   Update `vesuvius-inference.py` line 75: `T_low=0.60`. Push and submit. Quick win.
-2. **Investigate 0.504 vs 0.545 gap** — Our v20 scored 0.504 vs competitor's 0.545 with
-   same weights. Possible causes: PP params (T_low fix above), binary mode (try class1),
-   or subtle implementation difference in dual-stream averaging.
-3. **Try simpler single-stream** — The 0.537 baseline uses single stream + simple threshold.
-   Might score better than our dual-stream if the dual-stream implementation has issues.
-4. **Fine-tune TransUNet** — `scripts/train_transunet.py` exists but untested.
-   bs=1, grad_accum=4, ~0.8 hours for 10 epochs.
-5. **Loss functions** for fine-tuning: SparseDiceCE + 0.75*SkeletonRecall + 0.50*FP_Volume.
-   VOI is our biggest weakness (35% of metric) — need smooth, unfragmented output.
+1. **Check eval results** in `logs/eval_v3_results.csv` — compare pretrained vs ep5/10/15/20/25/best
+2. **If baseline_v3 improves** → train variants (higher FP_Volume=1.5, DistFromSkeleton)
+3. **If baseline_v3 still degrades** → investigate MEDIUM-risk items (FG sampling, batch size)
+4. **Push best fine-tuned weights** to Kaggle as v22
+5. **Consider ensemble** of pretrained + fine-tuned for submission
 
-**Hardware:** GPU 1 only (RTX 5090). GPU 2 paused. GPU 3 shut down.
+**Hardware:** GPU 1 only (RTX 5090).
 
 ## Investigations
 
@@ -249,23 +428,20 @@ rather than thresholding the whole blob.
 - If TransUNet fine-tuning leaves spare GPU time, could revisit refinement on top of
   TransUNet probmaps. Low priority.
 
-## Strategy (REVISED Feb 18 morning)
+## Strategy (REVISED Feb 19)
 
-**Two-phase plan for the final 9 days.** Replaying public notebooks caps us at ~0.552.
+**Two-phase plan for the final 8 days.** Replaying public notebooks caps us at ~0.552.
 To reach top 10 (0.57-0.60+), we need novel approaches beyond what's publicly shared.
 
-### Phase 1: Aggressive / swing for the fences (Feb 18-23, 5-6 days)
+### Phase 1: Aggressive / swing for the fences (Feb 19-23, 4-5 days)
 
-**Quick wins (Day 1):**
-- Push v21 with T_low=0.6 (or adaptive if analysis supports it)
-- Adaptive T_low analysis (running, results pending)
-
-**Foundation — Fine-tune TransUNet (Days 1-2):**
+**Foundation — Fine-tune TransUNet (Day 1, Feb 19):**
+- baseline_v3 training IN PROGRESS with z-score norm fix
 - Train with SparseDiceCE + 0.75*SkeletonRecall + 0.50*FP_Volume
 - AdamW, lr=5e-5, cosine decay, wd=1e-5, bs=1 + grad_accum=4
 - 3D CutOut augmentation (6 blocks, 2-8 voxels)
-- ~1 hour per 10 epochs. Checkpoint every epoch.
-- This is table-stakes, not our differentiator.
+- ~3.7 hours training + ~1.5 hours eval = ~5 hours total
+- If baseline_v3 improves on pretrained, try variants (higher FP_Volume, dist loss)
 
 **Novel approaches — our edge (Days 3-6):**
 
@@ -314,12 +490,17 @@ To reach top 10 (0.57-0.60+), we need novel approaches beyond what's publicly sh
 - [x] **Overnight pipeline (6 phases)** — All completed. 82-vol val, TTA, cross-scroll, PP sweep.
 - [x] **Kaggle TransUNet v20** — 0.504 public LB. Dual-stream + 7-TTA + seeded hysteresis.
 
-### In progress
-- [~] **Adaptive T_low analysis** — 20-volume sweep running. Early signal: correlations exist.
-- [~] **Fine-tune TransUNet** — Setting up training with SkeletonRecall loss.
+### Done (recent)
+- [x] **Adaptive T_low analysis** — Best fixed T_low=0.70 (comp=0.5324 vs 0.5267 at 0.60). Adaptive not worthwhile.
+- [x] **Push v21** — T_low=0.70 pushed to Kaggle. Scored 0.504 (same as v20).
+- [x] **Training bug investigation** — Found normalization mismatch + intensity shift bugs. Fixed in baseline_v3.
+- [x] **Training pipeline comparison** — Comprehensive diff vs competitor. Only HIGH-risk items were the two bugs (now fixed).
 
-### Next up
-- [ ] **Push v21** — T_low=0.6 (or adaptive if analysis supports it).
+### In progress
+- [~] **Fine-tune TransUNet (baseline_v3)** — Training done. Eval sweep in progress (ep25 evaluating).
+- [~] **Fine-tune variants (overnight)** — 3 GPUs running: thin_fp (gpu1), dist_skel (gpu2), dist_sq (gpu0, pending).
+
+### Not started
 - [ ] **Component-level refinement** — Novel learned post-processing targeting VOI.
 - [ ] **Pseudo-labeling** — Retrain with soft labels on unlabeled regions.
 - [ ] **Ensemble** — Fine-tuned + pretrained TransUNet logit averaging.
@@ -358,6 +539,7 @@ tokens: `rm /tmp/.kaggle/uploads/*.json`. Use `--dir-mode zip` for subdirectorie
 | v18 | TransUNet comboloss | Feb 17 | FAILED | FileNotFoundError — model_sources path wrong |
 | v19 | TransUNet comboloss | Feb 17 | FAILED | Same issue (dataset not ready) |
 | v20 | TransUNet comboloss | Feb 17 | **0.504** | Dual-stream + 7-fold TTA + seeded hysteresis |
+| v21 | TransUNet comboloss | Feb 18 | PENDING | T_low=0.70 (cross-scroll optimized) |
 
 ## File Structure
 ```

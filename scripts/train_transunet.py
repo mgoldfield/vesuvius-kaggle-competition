@@ -78,13 +78,25 @@ class VesuviusPatchDataset(Dataset):
         if vid not in self._cache:
             img = tifffile.imread(TRAIN_IMG / f"{vid}.tif")
             lbl = tifffile.imread(TRAIN_LBL / f"{vid}.tif")
-            # Store as uint8 to save memory, convert to float32 in __getitem__
-            self._cache[vid] = (img, lbl)
+            # Compute z-score normalization stats from full volume (nonzero voxels)
+            # This matches medicai's NormalizeIntensity(nonzero=True, channel_wise=False)
+            # which is used in our eval pipeline and Kaggle inference notebook.
+            img_f = img.astype(np.float32)
+            nonzero = img_f != 0
+            if nonzero.any():
+                mean = float(img_f[nonzero].mean())
+                std = float(img_f[nonzero].std())
+                if std == 0:
+                    std = 1.0
+            else:
+                mean, std = 0.0, 1.0
+            # Store raw uint8 + stats to save memory (~33MB per vol vs ~131MB for float32)
+            self._cache[vid] = (img, lbl, mean, std)
         return self._cache[vid]
 
     def __getitem__(self, idx):
         vid = self.vol_ids[idx]
-        img_raw, lbl_raw = self._load(vid)
+        img_raw, lbl_raw, mean, std = self._load(vid)
         img = img_raw.astype(np.float32)
         lbl = lbl_raw.astype(np.float32)
 
@@ -111,11 +123,14 @@ class VesuviusPatchDataset(Dataset):
         img_patch = img[d0:d0+ps, h0:h0+ps, w0:w0+ps]
         lbl_patch = lbl[d0:d0+ps, h0:h0+ps, w0:w0+ps]
 
+        # Z-score normalize using full-volume stats (matches eval pipeline)
+        # Apply BEFORE augmentation so intensity shift operates in z-score space
+        nonzero = img_patch != 0
+        img_patch = img_patch.copy()
+        img_patch[nonzero] = (img_patch[nonzero] - mean) / std
+
         if self.train:
             img_patch, lbl_patch = self._augment(img_patch, lbl_patch)
-
-        # Normalize: scale 0-255 to 0-1
-        img_patch = img_patch / 255.0
 
         # Generate skeleton target and distance map for training
         skel = self._generate_skeleton(lbl_patch)
@@ -128,7 +143,10 @@ class VesuviusPatchDataset(Dataset):
         return img_out.astype(np.float32), lbl_out.astype(np.float32)
 
     def _augment(self, img, lbl):
-        """Competitor augmentation: flips, rotations, intensity shift, 3D CutOut."""
+        """Augmentation: flips, rotations, intensity shift, 3D CutOut.
+
+        Input img is already z-score normalized. Augmentations operate in z-score space.
+        """
         # Random flips (all 3 axes, p=0.5)
         for axis in range(3):
             if random.random() < 0.5:
@@ -141,12 +159,15 @@ class VesuviusPatchDataset(Dataset):
             img = np.rot90(img, k=k, axes=(0, 1)).copy()
             lbl = np.rot90(lbl, k=k, axes=(0, 1)).copy()
 
-        # Random intensity shift (+/-0.15, p=0.5)
+        # Random intensity shift in z-score space (p=0.5)
+        # ±0.10 std devs, matching competitor TPU notebook's
+        # RandShiftIntensity(offsets=0.10) applied after z-score normalization
         if random.random() < 0.5:
-            shift = random.uniform(-0.15, 0.15) * 255
-            img = np.clip(img + shift, 0, 255)
+            shift = random.uniform(-0.10, 0.10)
+            img = img + shift
 
         # 3D CutOut (up to 6 random cuboid blocks, p=1.0)
+        # Fill with 0 = mean intensity in z-score space
         for _ in range(6):
             bs = random.randint(2, 8)
             d0 = random.randint(0, max(0, img.shape[0] - bs))
@@ -187,7 +208,7 @@ def collate_fn(batch):
 
 
 # ── Loss function (Keras) ────────────────────────────────
-def build_loss(num_classes=3, w_srec=0.75, w_fp=0.50, w_dist=0.0):
+def build_loss(num_classes=3, w_srec=0.75, w_fp=0.50, w_dist=0.0, dist_power=1.0):
     """Build the SkeletonRecallPlusDiceLoss using Keras ops.
 
     Args:
@@ -242,7 +263,8 @@ def build_loss(num_classes=3, w_srec=0.75, w_fp=0.50, w_dist=0.0):
                 # Penalize predictions proportionally to their distance from
                 # the GT skeleton. Predictions ON the skeleton get zero penalty.
                 # Predictions far from it get high penalty.
-                dist_penalty = pred_ink_prob * y_true_dist * valid_mask
+                dist_term = y_true_dist ** dist_power if dist_power != 1.0 else y_true_dist
+                dist_penalty = pred_ink_prob * dist_term * valid_mask
                 dist_loss = keras.ops.sum(dist_penalty) / (
                     keras.ops.sum(valid_mask) + 1e-6
                 )
@@ -271,6 +293,8 @@ def main():
                         help='SkeletonRecall loss weight (default 0.75)')
     parser.add_argument('--dist-weight', type=float, default=0.0,
                         help='Distance-from-skeleton loss weight (0=disabled)')
+    parser.add_argument('--dist-power', type=float, default=1.0,
+                        help='Power for distance term (1=linear, 2=quadratic)')
     args = parser.parse_args()
 
     if args.dry_run:
@@ -280,9 +304,12 @@ def main():
     from medicai.models import TransUNet
     from medicai.metrics import SparseDiceMetric
 
-    # Mixed precision to fit fwd+bwd in 32GB VRAM
-    keras.mixed_precision.set_global_policy('mixed_float16')
-    print("Mixed precision: float16 compute, float32 weights")
+    # Use bfloat16 — same exponent range as float32 (no gradient underflow)
+    # but half the memory like float16. mixed_float16 caused underflow on
+    # SkeletonRecall and FP_Volume gradient signals. Competitor trained on TPU
+    # which uses bfloat16 natively.
+    keras.mixed_precision.set_global_policy('mixed_bfloat16')
+    print("Mixed precision: bfloat16 compute, float32 weights")
 
     # Per-run checkpoint directory
     ckpt_dir = ROOT / "checkpoints" / f"transunet_{args.run_name}"
@@ -341,7 +368,7 @@ def main():
     )
 
     loss_fn = build_loss(w_srec=args.skel_weight, w_fp=args.fp_weight,
-                         w_dist=args.dist_weight)
+                         w_dist=args.dist_weight, dist_power=args.dist_power)
 
     # Note: gradient_accumulation_steps in Keras 3 optimizer
     if args.grad_accum > 1:
@@ -360,7 +387,7 @@ def main():
     print(f"  Effective batch size: {args.grad_accum}")
     print(f"  Steps/epoch: {len(train_loader)}")
     print(f"  Total steps: {total_steps}")
-    print(f"  Loss weights: skel={args.skel_weight}, fp={args.fp_weight}, dist={args.dist_weight}")
+    print(f"  Loss weights: skel={args.skel_weight}, fp={args.fp_weight}, dist={args.dist_weight}, dist_power={args.dist_power}")
     print(f"  Checkpoint dir: {ckpt_dir}")
 
     # ── Training loop ──

@@ -72,7 +72,7 @@ CFG = dict(
     INK_MODE="fg12",
 
     # Hysteresis thresholds
-    T_low=0.50,
+    T_low=0.70,
     T_high=0.90,
 
     # Closing and dust removal
@@ -168,7 +168,7 @@ def build_anisotropic_struct(z_radius, xy_radius):
 
 def seeded_hysteresis_with_topology(
     prob, pub_fg_bool,
-    T_low=0.50, T_high=0.90,
+    T_low=0.70, T_high=0.90,
     z_radius=3, xy_radius=2, dust_min_size=100,
 ):
     """Seeded hysteresis with public-stream weak region expansion."""
