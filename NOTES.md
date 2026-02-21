@@ -541,20 +541,59 @@ To reach top 10 (0.57-0.60+), we need novel approaches beyond what's publicly sh
 - [~] **Fine-tune variants (overnight)** — 3 GPUs running: thin_fp (gpu1), dist_skel (gpu2), dist_sq (gpu0, pending).
 
 ### Not started
-- [ ] **SDice recovery for thinned models** — Fine-tuning improves VOI (0.5517→0.5281)
-  but destroys SDice (0.8255→0.7873). Theory: the thinner predictions are *better* but
-  lose surface boundary alignment. Two-pronged fix:
-  1. **Loss function tweaks** — Add explicit surface-alignment term (boundary loss,
-     surface dice proxy) to preserve SDice while keeping the VOI improvement from thinning.
-  2. **Post-processing** — Morphological dilation or surface-aware expansion of thinned
-     predictions to recover boundary coverage without re-thickening the interior.
-  If we can keep the VOI gain and recover even half the SDice loss, that's a net win.
-- [ ] **Discriminative LR training** — Script ready (`launch_gpu1_discrim.sh`). Enc=lr/100,
-  dec=lr/10, head=lr. Preserves encoder features that drive SDice.
-- [ ] **Frozen encoder training** — Script ready (`launch_gpu2_frozen.sh`). Zero encoder
-  degradation risk, only adapts decoder+head.
-- [ ] **SWA weight averaging** — Script ready (`swa_average.py`). Average pretrained +
-  fine-tuned weights. Zero-cost experiment on existing checkpoints.
+- [ ] **Thinning strategy: model trains thin + PP reconnects** — Core insight: the model
+  must learn thinness (it has 3D context); PP should reconnect fragments (not thin).
+  Post-processing-only thinning (ridge extraction) destroys topology (topo 0.29→0.005).
+
+  **Training for thinness (current approaches):**
+  - dist_sq loss (skel=0.75, fp=1.5, dist=2.0, power=2.0) IS the thinning signal.
+    Penalizes predictions far from skeleton with quadratic falloff.
+  - Frozen encoder + dist_sq (gpu2): protects encoder while decoder learns thin output.
+  - Discriminative LR + dist_sq (gpu1): slows encoder learning to preserve features.
+  - SWA blending: 70/30 pretrained+dist_sq gives small improvement (0.5530 vs 0.5526).
+
+  **Other thinning training ideas to explore:**
+  - **clDice loss** — Dice computed on skeletonized pred vs skeletonized GT. Directly
+    measures thin-structure alignment. Was used in Stage 1 of the pretrained model.
+    Could re-add alongside dist_sq.
+  - **Boundary loss** — Penalize distance from GT surface boundary (not skeleton).
+    Different from dist_sq: boundary loss cares about where the edges of the GT are,
+    dist_sq cares about distance from the centerline. Could help SDice directly.
+  - **Higher dist_sq power** — power=3 or 4 instead of 2 for more aggressive thinning
+    of outer voxels while keeping the core.
+  - **Gradient sharpness penalty** — Penalize low gradient magnitude in the probmap.
+    Sharp transitions (thin) have high gradients; thick blobs have low gradients.
+    Encourages peaked probability ridges.
+  - **Distance transform regression** — Predict distance-to-surface instead of binary
+    class. Zero-crossing of a distance field is always a thin surface by definition.
+    Big architecture change but fundamentally produces thin outputs.
+
+  **Priority next training experiments:** clDice and boundary loss are the most actionable.
+  Both are well-studied, easy to add to existing training, and directly target the
+  SDice/thinness tradeoff. clDice was already used in Stage 1 of the pretrained model.
+  Boundary loss is complementary to dist_sq: dist_sq says "be near the center" while
+  boundary loss says "don't extend past the edges". Together they squeeze predictions
+  thin from both sides.
+
+  **Connectivity-focused PP (the missing piece):**
+  - **Probmap-guided gap filling** — For nearby CCs, trace path through probmap.
+    If min prob along path > threshold (e.g., 0.15-0.20), fill the gap. Uses the
+    model's sub-threshold confidence about gap regions.
+  - **Dilate-merge-erode** — Dilate all CCs by 1-2 voxels, relabel (merging CCs that
+    now touch), erode back. Net: connections form but thickness doesn't increase.
+  - **Two-pass hysteresis** — First pass: standard thresholding. Second pass: very low
+    t_low (0.15-0.20) but only keep new voxels if they connect two existing CCs.
+  - **Higher T_low** — T_low=0.80 beats 0.70 on pretrained probmaps (0.5430 vs 0.5418,
+    2 vols). With sharper model predictions, even higher T_low may be optimal.
+
+  Ridge thinning results: `logs/ridge_thinning_results.csv`
+
+- [~] **Discriminative LR training** — Running on gpu1 (`launch_gpu1_discrim.sh`). Enc=lr/100,
+  dec=lr/10, head=lr. Epoch 7/25, val_loss=1.357.
+- [~] **Frozen encoder training** — Running on gpu2 (`launch_gpu2_frozen.sh`). Zero encoder
+  degradation risk, only adapts decoder+head. Epoch 11/25, val_loss=1.135 (promising).
+- [x] **SWA weight averaging** — 70/30 pretrained+dist_sq_ep5 beats pretrained (0.5530 vs
+  0.5526). First approach to improve on pretrained. Results: `logs/eval_swa_results.csv`
 - [ ] **Component-level refinement** — Novel learned post-processing targeting VOI.
 - [ ] **Pseudo-labeling** — Retrain with soft labels on unlabeled regions.
 - [ ] **Ensemble** — Fine-tuned + pretrained TransUNet logit averaging.

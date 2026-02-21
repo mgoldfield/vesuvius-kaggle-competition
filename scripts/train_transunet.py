@@ -135,10 +135,11 @@ class VesuviusPatchDataset(Dataset):
         # Generate skeleton target and distance map for training
         skel = self._generate_skeleton(lbl_patch)
         dist = self._generate_dist_from_skeleton(lbl_patch)
+        bdist = self._generate_boundary_dist(lbl_patch)
 
-        # channels-last format: (D, H, W, 1) and (D, H, W, 3)
+        # channels-last format: (D, H, W, 1) and (D, H, W, 4)
         img_out = img_patch[..., None]  # (D,H,W,1)
-        lbl_out = np.stack([lbl_patch, skel, dist], axis=-1)  # (D,H,W,3)
+        lbl_out = np.stack([lbl_patch, skel, dist, bdist], axis=-1)  # (D,H,W,4)
 
         return img_out.astype(np.float32), lbl_out.astype(np.float32)
 
@@ -200,6 +201,23 @@ class VesuviusPatchDataset(Dataset):
         dist = np.clip(dist / 10.0, 0, 1)
         return dist
 
+    def _generate_boundary_dist(self, lbl):
+        """Signed distance transform from GT boundary (Kervadec et al. 2019).
+        Negative inside foreground, positive outside, zero at boundary.
+        Normalized by max distance per patch."""
+        fg = (lbl == 1)
+        if not fg.any():
+            return np.zeros_like(lbl, dtype=np.float32)
+        bg = ~fg
+        dist_in = distance_transform_edt(fg)
+        dist_out = distance_transform_edt(bg)
+        signed = dist_out - dist_in
+        max_d = max(np.abs(signed).max(), 1.0)
+        signed = signed / max_d
+        # Zero out unlabeled regions
+        signed[lbl == 2] = 0.0
+        return signed.astype(np.float32)
+
 
 def collate_fn(batch):
     """Stack into numpy arrays (Keras expects numpy, not torch tensors for channels-last)."""
@@ -208,7 +226,8 @@ def collate_fn(batch):
 
 
 # ── Loss function (Keras) ────────────────────────────────
-def build_loss(num_classes=3, w_srec=0.75, w_fp=0.50, w_dist=0.0, dist_power=1.0):
+def build_loss(num_classes=3, w_srec=0.75, w_fp=0.50, w_dist=0.0, dist_power=1.0,
+               w_boundary=0.0):
     """Build the SkeletonRecallPlusDiceLoss using Keras ops.
 
     Args:
@@ -216,6 +235,9 @@ def build_loss(num_classes=3, w_srec=0.75, w_fp=0.50, w_dist=0.0, dist_power=1.0
         w_fp: Weight for FP volume loss (default 0.50). Higher = thinner predictions.
         w_dist: Weight for distance-from-skeleton loss (default 0.0 = disabled).
                 Penalizes predictions that are far from the GT skeleton centerline.
+        w_boundary: Weight for boundary loss (default 0.0 = disabled).
+                    Signed distance from GT boundary — penalizes predictions outside GT,
+                    rewards predictions inside GT (Kervadec et al. 2019).
     """
     import keras
     from medicai.losses import SparseDiceCELoss
@@ -270,6 +292,16 @@ def build_loss(num_classes=3, w_srec=0.75, w_fp=0.50, w_dist=0.0, dist_power=1.0
                 )
                 total = total + w_dist * dist_loss
 
+            # 5. Boundary loss (optional, Kervadec et al. 2019)
+            if w_boundary > 0:
+                # Signed distance: positive outside GT, negative inside GT.
+                # Minimizing pred * signed_dist pushes predictions toward GT boundary.
+                y_true_bdist = y_true[..., 3]
+                bd_loss = keras.ops.sum(pred_ink_prob * y_true_bdist * valid_mask) / (
+                    keras.ops.sum(valid_mask) + 1e-6
+                )
+                total = total + w_boundary * bd_loss
+
             return total
 
     return SkeletonRecallPlusDiceLoss(name="skel_recall_fp_loss")
@@ -295,6 +327,8 @@ def main():
                         help='Distance-from-skeleton loss weight (0=disabled)')
     parser.add_argument('--dist-power', type=float, default=1.0,
                         help='Power for distance term (1=linear, 2=quadratic)')
+    parser.add_argument('--boundary-weight', type=float, default=0.0,
+                        help='Boundary loss weight (0=disabled). Penalizes distance from GT surface boundary.')
     parser.add_argument('--freeze-encoder', action='store_true',
                         help='Freeze CNN encoder (SEResNeXt50), only train decoder + head')
     parser.add_argument('--discriminative-lr', action='store_true',
@@ -378,7 +412,8 @@ def main():
 
     total_steps = len(train_loader) * args.epochs
     loss_fn = build_loss(w_srec=args.skel_weight, w_fp=args.fp_weight,
-                         w_dist=args.dist_weight, dist_power=args.dist_power)
+                         w_dist=args.dist_weight, dist_power=args.dist_power,
+                         w_boundary=args.boundary_weight)
 
     if use_torch_optim:
         # Discriminative LR: use PyTorch optimizer with parameter groups.
@@ -458,7 +493,7 @@ def main():
     print(f"  Effective batch size: {args.grad_accum}")
     print(f"  Steps/epoch: {len(train_loader)}")
     print(f"  Total steps: {total_steps}")
-    print(f"  Loss weights: skel={args.skel_weight}, fp={args.fp_weight}, dist={args.dist_weight}, dist_power={args.dist_power}")
+    print(f"  Loss weights: skel={args.skel_weight}, fp={args.fp_weight}, dist={args.dist_weight}, dist_power={args.dist_power}, boundary={args.boundary_weight}")
     print(f"  Freeze encoder: {args.freeze_encoder}")
     print(f"  Checkpoint dir: {ckpt_dir}")
 
