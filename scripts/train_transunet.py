@@ -227,7 +227,7 @@ def collate_fn(batch):
 
 # ── Loss function (Keras) ────────────────────────────────
 def build_loss(num_classes=3, w_srec=0.75, w_fp=0.50, w_dist=0.0, dist_power=1.0,
-               w_boundary=0.0):
+               w_boundary=0.0, w_cldice=0.0):
     """Build the SkeletonRecallPlusDiceLoss using Keras ops.
 
     Args:
@@ -238,6 +238,9 @@ def build_loss(num_classes=3, w_srec=0.75, w_fp=0.50, w_dist=0.0, dist_power=1.0
         w_boundary: Weight for boundary loss (default 0.0 = disabled).
                     Signed distance from GT boundary — penalizes predictions outside GT,
                     rewards predictions inside GT (Kervadec et al. 2019).
+        w_cldice: Weight for centerline Dice loss (default 0.0 = disabled).
+                  Measures skeleton overlap between pred and GT. Rewards correct
+                  topology — complementary to dist_sq (penalty) and boundary (penalty).
     """
     import keras
     from medicai.losses import SparseDiceCELoss
@@ -247,6 +250,19 @@ def build_loss(num_classes=3, w_srec=0.75, w_fp=0.50, w_dist=0.0, dist_power=1.0
         num_classes=num_classes,
         ignore_class_ids=2,
     )
+
+    # clDice loss (optional) — uses soft-skeletonization, differentiable
+    cldice_loss_fn = None
+    if w_cldice > 0:
+        from medicai.losses import SparseCenterlineDiceLoss
+        cldice_loss_fn = SparseCenterlineDiceLoss(
+            from_logits=False,
+            num_classes=num_classes,
+            target_class_ids=1,
+            ignore_class_ids=2,
+            iters=50,
+            memory_efficient_skeleton=True,
+        )
 
     class SkeletonRecallPlusDiceLoss(keras.losses.Loss):
         def call(self, y_true, y_pred):
@@ -302,6 +318,11 @@ def build_loss(num_classes=3, w_srec=0.75, w_fp=0.50, w_dist=0.0, dist_power=1.0
                 )
                 total = total + w_boundary * bd_loss
 
+            # 6. Centerline Dice loss (optional)
+            if cldice_loss_fn is not None:
+                cldice = cldice_loss_fn(y_true_mask[..., None], y_pred)
+                total = total + w_cldice * cldice
+
             return total
 
     return SkeletonRecallPlusDiceLoss(name="skel_recall_fp_loss")
@@ -329,6 +350,10 @@ def main():
                         help='Power for distance term (1=linear, 2=quadratic)')
     parser.add_argument('--boundary-weight', type=float, default=0.0,
                         help='Boundary loss weight (0=disabled). Penalizes distance from GT surface boundary.')
+    parser.add_argument('--cldice-weight', type=float, default=0.0,
+                        help='Centerline Dice loss weight (0=disabled). Rewards skeleton overlap between pred and GT.')
+    parser.add_argument('--label-dir', type=str, default=None,
+                        help='Custom label directory (default: data/train_labels/). Use for pseudo-labels.')
     parser.add_argument('--freeze-encoder', action='store_true',
                         help='Freeze CNN encoder (SEResNeXt50), only train decoder + head')
     parser.add_argument('--discriminative-lr', action='store_true',
@@ -337,6 +362,12 @@ def main():
 
     if args.dry_run:
         args.epochs = 1
+
+    # Override label directory if specified (for pseudo-labels)
+    global TRAIN_LBL
+    if args.label_dir:
+        TRAIN_LBL = Path(args.label_dir)
+        print(f"Using custom label dir: {TRAIN_LBL}")
 
     import keras
     from medicai.models import TransUNet
@@ -413,7 +444,8 @@ def main():
     total_steps = len(train_loader) * args.epochs
     loss_fn = build_loss(w_srec=args.skel_weight, w_fp=args.fp_weight,
                          w_dist=args.dist_weight, dist_power=args.dist_power,
-                         w_boundary=args.boundary_weight)
+                         w_boundary=args.boundary_weight,
+                         w_cldice=args.cldice_weight)
 
     if use_torch_optim:
         # Discriminative LR: use PyTorch optimizer with parameter groups.
@@ -493,7 +525,7 @@ def main():
     print(f"  Effective batch size: {args.grad_accum}")
     print(f"  Steps/epoch: {len(train_loader)}")
     print(f"  Total steps: {total_steps}")
-    print(f"  Loss weights: skel={args.skel_weight}, fp={args.fp_weight}, dist={args.dist_weight}, dist_power={args.dist_power}, boundary={args.boundary_weight}")
+    print(f"  Loss weights: skel={args.skel_weight}, fp={args.fp_weight}, dist={args.dist_weight}, dist_power={args.dist_power}, boundary={args.boundary_weight}, cldice={args.cldice_weight}")
     print(f"  Freeze encoder: {args.freeze_encoder}")
     print(f"  Checkpoint dir: {ckpt_dir}")
 

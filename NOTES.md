@@ -84,7 +84,84 @@ All share the same training data, pretrained weights, scripts, and venv.
     p90/p95/p99 percentile). All score identically at 0.5737. What matters is binary: T_HIGH
     below max prob → good; above → catastrophic. Fixed 0.75 is simplest and most robust.
 
-## Current Status (Feb 19)
+## Current Status (Feb 21)
+
+### SWA topo-focused blending — new best model (comp=0.5549)
+
+Blending pretrained with frozen_boundary checkpoints (best individual topo/VOI scores).
+All 6 blends beat pretrained. 70/30 ratio consistently best.
+
+| Model | Comp | Topo | SDice | VOI | n |
+|-------|------|------|-------|-----|---|
+| pretrained (baseline) | 0.5526 | 0.2354 | 0.8255 | 0.5517 | 24 |
+| swa_90pre_10topo (ep10) | 0.5544 | 0.2403 | 0.8285 | 0.5496 | 24 |
+| swa_80pre_20topo (ep10) | 0.5531 | 0.2396 | 0.8300 | 0.5450 | 24 |
+| swa_70pre_30topo (ep10) | 0.5545 | 0.2490 | 0.8301 | 0.5407 | 24 |
+| swa_60pre_40topo (ep10) | 0.5541 | 0.2507 | 0.8287 | 0.5395 | 24 |
+| **swa_70pre_30topo_ep5** | **0.5549** | 0.2499 | 0.8291 | 0.5420 | 24 |
+| swa_70pre_30sdice_ep15 | 0.5548 | 0.2489 | 0.8301 | 0.5418 | 24 |
+
+Results: `logs/eval_swa_topo_results.csv`
+Weights: `checkpoints/swa_topo/`
+
+### Completed experiments (Feb 20-21)
+
+| Model | Best Comp | Best Topo | Best SDice | Notes |
+|-------|-----------|-----------|------------|-------|
+| frozen_boundary (gpu2) | 0.5408 (ep10) | **0.2642** (ep10) | 0.7871 (ep15) | Best individual topo score |
+| frozen_dist_sq (gpu2) | 0.5402 (ep25) | 0.2634 (ep25) | 0.7885 (ep10) | Similar to frozen_boundary |
+| discrim_dist_sq (gpu1) | 0.5269 (ep25) | 0.2292 (ep15/25) | 0.7841 (ep25) | Worse than frozen |
+| discrim_boundary (gpu1) | (training, ep 23/25) | — | — | ETA: ~5 hrs with eval |
+
+Results: `logs/eval_frozen_boundary_results.csv`, `logs/eval_frozen_dist_sq_results.csv`, `logs/eval_discrim_dist_sq_results.csv`
+
+### PP sweep on dist_sq probmaps (completed)
+
+26 configs on dist_sq_ep5 probmaps. Key findings:
+- T_low is the only meaningful PP parameter. Everything else is noise (±0.001).
+- dist_sq model optimal T_low=0.30-0.40 (vs pretrained's 0.70) — thinner predictions need lower threshold
+- PP barely helps fine-tuned models (best config 0.506 vs pretrained's 0.553 — gap is in the model)
+- Results: `logs/postprocessing_sweep.csv`
+
+### Multi-model comparison notebook (created)
+
+Visual exploration notebook comparing top models: pretrained, swa_70pre_30distsq, frozen_boundary_ep10, dist_sq_ep5.
+Sections: score summary, cross-sections, probability distributions, thickness analysis, SDice deep dive,
+connected components, PP analysis.
+- Notebook: `notebooks/analysis/multi_model_comparison.ipynb`
+- Executed: `notebooks/analysis/multi_model_comparison_executed.ipynb` (21 images, no errors)
+
+### Pseudo-labeling pipeline (launched Feb 21 evening)
+
+Novel approach: use best model's high-confidence predictions to convert unlabeled voxels (label=2,
+~52% of each volume) into training signal. Dry-run stats: 80.4% of unlabeled voxels converted at
+0.85/0.15 thresholds, FG nearly doubles.
+
+Pipeline stages (running on gpu0):
+1. Probmap generation: 704 training volumes × 9s/vol = ~1.8 hrs
+2. Pseudo-label creation: ~5 min
+3. Training: frozen encoder, 25 epochs, SWA blend as starting weights
+4. Eval sweep
+
+Scripts: `scripts/generate_probmaps.py`, `scripts/generate_pseudo_labels.py`, `scripts/run_pseudo_pipeline.sh`
+Training: `--label-dir data/pseudo_labels` flag added to `train_transunet.py`
+Log: `logs/pseudo_pipeline.log`
+
+### Hardware status
+
+| GPU | Status | Task |
+|-----|--------|------|
+| gpu0 | Running | Pseudo-labeling pipeline (~19 hrs total) |
+| gpu1 | Running | discrim_boundary training (ep 23/25) + auto-eval |
+| gpu2 | **Off** | All data synced to gpu0 |
+
+gpu1: `ssh -i ~/.ssh/remote-gpu -o StrictHostKeyChecking=no root@74.2.96.43 -p 10816`
+
+### Disk usage (gpu0)
+
+107 GB / 350 GB used. Pseudo-labeling will add ~69 GB → ~176 GB total.
+
+## Previous Status (Feb 19)
 
 ### Critical bug found and fixed: Training normalization mismatch
 
@@ -247,6 +324,32 @@ Key insights:
 
 Results: `logs/eval_swa_results.csv`
 Weights: `checkpoints/swa/`
+
+**SWA topo-focused blending results (Feb 21)**
+
+Blending pretrained with frozen_boundary checkpoints (best individual topo scores).
+These are our new best models — frozen_boundary_ep10 had topo=0.2642, ep5 had topo=0.2619.
+
+| Model | Comp | Topo | SDice | VOI | n |
+|-------|------|------|-------|-----|---|
+| pretrained (baseline) | 0.5526 | 0.2354 | 0.8255 | 0.5517 | 24 |
+| swa_90pre_10topo (ep10) | 0.5544 | 0.2403 | 0.8285 | 0.5496 | 24 |
+| swa_80pre_20topo (ep10) | 0.5531 | 0.2396 | 0.8300 | 0.5450 | 24 |
+| swa_70pre_30topo (ep10) | 0.5545 | 0.2490 | 0.8301 | 0.5407 | 24 |
+| swa_60pre_40topo (ep10) | 0.5541 | 0.2507 | 0.8287 | 0.5395 | 24 |
+| **swa_70pre_30topo_ep5** | **0.5549** | **0.2499** | 0.8291 | 0.5420 | 24 |
+| swa_70pre_30sdice_ep15 | (evaluating) | | | | |
+
+Key insights:
+- **New overall best: swa_70pre_30topo_ep5 at comp=0.5549** (+0.0023 over pretrained)
+- All 5 completed blends beat pretrained (0.5526)
+- 70/30 ratio is the sweet spot — consistent across both dist_sq and frozen_boundary blends
+- Topo improvement is substantial (+0.014 at 70/30) with SDice maintained or improved
+- ep5 (second-best topo source) slightly outperforms ep10 (best topo source) in the blend
+- 6th blend (ep15, best SDice among frozen) still evaluating on gpu2
+
+Results: `logs/eval_swa_topo_results.csv` (on gpu2)
+Weights: `checkpoints/swa_topo/` (on gpu2)
 
 ### v21 submitted — scored 0.504
 

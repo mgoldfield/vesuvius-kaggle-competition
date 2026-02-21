@@ -52,6 +52,14 @@ better than my initial approach of post-processing-only thinning.
   asked for this policy.
 - **NFS-cached logs can be stale.** When checking remote GPU progress, read
   logs on the remote machine itself, not from the shared network volume.
+- **Disk tools overreport space.** `df` shows NFS volume capacity (~1.7 PB) not
+  rented allocation (350 GB on gpu0). Use `du -sh /workspace/` for real usage.
+  User can rent more cheaply — ask when approaching limits.
+- **Sync data before shutting down GPUs.** Always SCP checkpoints and logs back
+  to gpu0 before turning off remote GPUs. Verify with `ls -lh` after transfer.
+- **User values visual data exploration.** When asked to build notebooks, include
+  `%matplotlib inline` for rendering. Use the venv kernel (`vesuvius`) for execution.
+  Papermill works for background execution.
 
 ## Project Approach
 
@@ -63,3 +71,20 @@ alignment). The fix is two-pronged:
 
 The user prioritizes understanding the problem deeply over running many experiments.
 They'd rather run 3 well-motivated experiments than 10 random ones.
+
+## Current State (Feb 21)
+
+**Best model:** swa_70pre_30topo_ep5 (comp=0.5549). SWA blending is the winning
+strategy — no single fine-tuned model beats pretrained, but 70/30 blends consistently do.
+
+**Key finding:** No fine-tuning approach beats pretrained alone. All degrade SDice.
+SWA blending is the bridge — takes topo/VOI gains from fine-tuning while preserving
+pretrained's SDice.
+
+**Active experiments:**
+- Pseudo-labeling pipeline running on gpu0 (~19 hrs total)
+- discrim_boundary finishing on gpu1 (~5 hrs with eval)
+- Multi-scale inference on the roadmap for future (user interested, may rent larger GPU)
+
+**GPU status:** gpu0 + gpu1 active, gpu2 off. User prefers to keep old checkpoints
+and rent more disk if needed rather than delete.
