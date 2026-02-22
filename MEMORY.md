@@ -72,19 +72,26 @@ alignment). The fix is two-pronged:
 The user prioritizes understanding the problem deeply over running many experiments.
 They'd rather run 3 well-motivated experiments than 10 random ones.
 
-## Current State (Feb 21)
+## Current State (Feb 22, ~06:00 UTC)
 
 **Best model:** swa_70pre_30topo_ep5 (comp=0.5549). SWA blending is the winning
 strategy — no single fine-tuned model beats pretrained, but 70/30 blends consistently do.
 
-**Key finding:** No fine-tuning approach beats pretrained alone. All degrade SDice.
-SWA blending is the bridge — takes topo/VOI gains from fine-tuning while preserving
-pretrained's SDice.
-
 **Active experiments:**
-- Pseudo-labeling pipeline running on gpu0 (~19 hrs total)
-- discrim_boundary finishing on gpu1 (~5 hrs with eval)
-- Multi-scale inference on the roadmap for future (user interested, may rent larger GPU)
+- gpu0: Connectivity PP sweep running on SWA probmaps (43 configs, 82 vols). Probmaps done.
+  After SWA sweep → pretrained sweep automatically. ~4 hrs total.
+- gpu1 (RTX 6000 Ada 48GB): Setting up — installing packages, data transfer 89% done.
+  Pseudo-label training WITHOUT clDice (control). Needs user approval to launch.
+- gpu2 (RTX 6000 Ada 48GB): Pseudo-label training WITH clDice running (iters=10).
+  Ep1 step 400/704, ~20 min/epoch, ETA ~14:00 UTC for all 25 epochs. 46.7/49.1 GB VRAM.
+- Kaggle v22 score still PENDING.
 
-**GPU status:** gpu0 + gpu1 active, gpu2 off. User prefers to keep old checkpoints
-and rent more disk if needed rather than delete.
+**Key context:**
+- gpu2 SSH IP changed: now `root@195.26.233.87 -p 25763` (old IP timed out).
+- Pseudo-label training OOM'd on gpu0 (32GB). Denser pseudo-labels need >32GB GPU.
+- User wants approval before launching any new processes (in CLAUDE.md).
+- Connectivity PP sweep is DIFFERENT from the earlier standard PP sweep — tests
+  gap filling, dilate-merge-erode, two-pass hysteresis, and combined methods.
+- User is a night owl, may go to sleep soon and return ~1-2 PM ET (~18:00-19:00 UTC).
+
+**GPU status:** gpu0 (local) + gpu1 + gpu2, all active. Old gpu1 decommissioned.

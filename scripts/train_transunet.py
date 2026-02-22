@@ -188,7 +188,9 @@ class VesuviusPatchDataset(Dataset):
         return tubed.astype(np.float32)
 
     def _generate_dist_from_skeleton(self, lbl):
-        """Distance transform from GT skeleton. Used by dist-from-skeleton loss."""
+        """Distance transform from GT skeleton. Used by dist-from-skeleton loss.
+        Returns raw voxel distances capped at 10. Margin and power are applied
+        in the loss function so the margin parameter stays in voxel units."""
         mask = (lbl == 1)
         if not mask.any():
             return np.zeros_like(lbl, dtype=np.float32)
@@ -197,8 +199,8 @@ class VesuviusPatchDataset(Dataset):
             return np.zeros_like(lbl, dtype=np.float32)
         # Distance from each voxel to nearest skeleton voxel
         dist = distance_transform_edt(~skel).astype(np.float32)
-        # Normalize: cap at 10 voxels, scale to [0, 1]
-        dist = np.clip(dist / 10.0, 0, 1)
+        # Cap at 10 voxels to limit outlier influence
+        dist = np.clip(dist, 0, 10)
         return dist
 
     def _generate_boundary_dist(self, lbl):
@@ -227,7 +229,7 @@ def collate_fn(batch):
 
 # ── Loss function (Keras) ────────────────────────────────
 def build_loss(num_classes=3, w_srec=0.75, w_fp=0.50, w_dist=0.0, dist_power=1.0,
-               w_boundary=0.0, w_cldice=0.0):
+               dist_margin=0.0, w_boundary=0.0, w_cldice=0.0):
     """Build the SkeletonRecallPlusDiceLoss using Keras ops.
 
     Args:
@@ -235,6 +237,10 @@ def build_loss(num_classes=3, w_srec=0.75, w_fp=0.50, w_dist=0.0, dist_power=1.0
         w_fp: Weight for FP volume loss (default 0.50). Higher = thinner predictions.
         w_dist: Weight for distance-from-skeleton loss (default 0.0 = disabled).
                 Penalizes predictions that are far from the GT skeleton centerline.
+        dist_margin: Free-zone radius in voxels (default 0.0 = no margin, same as
+                     original dist_sq). Voxels within this distance of the skeleton
+                     get zero penalty. Beyond the margin, penalty = (dist - margin)^power.
+                     E.g., margin=3 allows surfaces up to ~6 voxels thick with no penalty.
         w_boundary: Weight for boundary loss (default 0.0 = disabled).
                     Signed distance from GT boundary — penalizes predictions outside GT,
                     rewards predictions inside GT (Kervadec et al. 2019).
@@ -298,10 +304,15 @@ def build_loss(num_classes=3, w_srec=0.75, w_fp=0.50, w_dist=0.0, dist_power=1.0
 
             # 4. Distance-from-skeleton penalty (optional)
             if w_dist > 0:
-                # Penalize predictions proportionally to their distance from
-                # the GT skeleton. Predictions ON the skeleton get zero penalty.
-                # Predictions far from it get high penalty.
-                dist_term = y_true_dist ** dist_power if dist_power != 1.0 else y_true_dist
+                # Penalize predictions based on distance from GT skeleton.
+                # With margin>0, voxels within `margin` voxels of the skeleton
+                # get zero penalty (free zone). Beyond that, penalty ramps up
+                # as (dist - margin)^power.
+                if dist_margin > 0:
+                    effective_dist = keras.ops.relu(y_true_dist - dist_margin)
+                else:
+                    effective_dist = y_true_dist
+                dist_term = effective_dist ** dist_power if dist_power != 1.0 else effective_dist
                 dist_penalty = pred_ink_prob * dist_term * valid_mask
                 dist_loss = keras.ops.sum(dist_penalty) / (
                     keras.ops.sum(valid_mask) + 1e-6
@@ -348,6 +359,10 @@ def main():
                         help='Distance-from-skeleton loss weight (0=disabled)')
     parser.add_argument('--dist-power', type=float, default=1.0,
                         help='Power for distance term (1=linear, 2=quadratic)')
+    parser.add_argument('--dist-margin', type=float, default=0.0,
+                        help='Free-zone radius in voxels (0=no margin). Voxels within this '
+                             'distance of skeleton get zero penalty. E.g., 3 allows ~6-voxel '
+                             'thick surfaces with no penalty.')
     parser.add_argument('--boundary-weight', type=float, default=0.0,
                         help='Boundary loss weight (0=disabled). Penalizes distance from GT surface boundary.')
     parser.add_argument('--cldice-weight', type=float, default=0.0,
@@ -444,6 +459,7 @@ def main():
     total_steps = len(train_loader) * args.epochs
     loss_fn = build_loss(w_srec=args.skel_weight, w_fp=args.fp_weight,
                          w_dist=args.dist_weight, dist_power=args.dist_power,
+                         dist_margin=args.dist_margin,
                          w_boundary=args.boundary_weight,
                          w_cldice=args.cldice_weight)
 
@@ -525,7 +541,7 @@ def main():
     print(f"  Effective batch size: {args.grad_accum}")
     print(f"  Steps/epoch: {len(train_loader)}")
     print(f"  Total steps: {total_steps}")
-    print(f"  Loss weights: skel={args.skel_weight}, fp={args.fp_weight}, dist={args.dist_weight}, dist_power={args.dist_power}, boundary={args.boundary_weight}, cldice={args.cldice_weight}")
+    print(f"  Loss weights: skel={args.skel_weight}, fp={args.fp_weight}, dist={args.dist_weight}, dist_power={args.dist_power}, dist_margin={args.dist_margin}, boundary={args.boundary_weight}, cldice={args.cldice_weight}")
     print(f"  Freeze encoder: {args.freeze_encoder}")
     print(f"  Checkpoint dir: {ckpt_dir}")
 
