@@ -260,7 +260,7 @@ def build_loss(num_classes=3, w_srec=0.75, w_fp=0.50, w_dist=0.0, dist_power=1.0
             num_classes=num_classes,
             target_class_ids=1,
             ignore_class_ids=2,
-            iters=50,
+            iters=10,
             memory_efficient_skeleton=True,
         )
 

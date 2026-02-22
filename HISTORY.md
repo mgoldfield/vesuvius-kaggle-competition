@@ -11,7 +11,7 @@ the disconnect between val metrics and public scores).
 
 ---
 
-## Training Run Details
+## Training Run Details (SegResNet era, Feb 5-16)
 
 ### Run 1: Baseline 3D U-Net
 - **Architecture:** 3D U-Net with BatchNorm, 22.6M params
@@ -81,12 +81,11 @@ the disconnect between val metrics and public scores).
 - **Issue:** lr_find auto-selected 5.75e-4 but the usable LR is ~1e-5.
 - **Notebook:** `notebooks/vesuvius_train_v8.ipynb`
 
-### Run 9: Lower Learning Rate (our current best model)
+### Run 9: Lower Learning Rate (best SegResNet model)
 - **LR:** Hardcoded 1e-5. Discriminative: encoder=1e-7, decoder=1e-6, head=1e-5
 - Everything else same as Run 8
 - **Results:** Best comp_score **0.570** at epoch 8 (vs Run 8's 0.562 at epoch 1)
   - Loss steadily decreased: train 0.523→0.480, valid 0.543→0.474
-  - Model improved continuously through epoch 8, then plateaued
   - Threshold sweep: T_low=0.40 won (dice=0.278)
   - Verification comp_score (3 volumes): 0.573, 0.546, 0.601 → mean **0.573**
 - **Notebook:** `notebooks/vesuvius_train_v9.ipynb`
@@ -125,7 +124,7 @@ the disconnect between val metrics and public scores).
 
 ---
 
-## Inference Pipeline Evaluation (Feb 12, 2026)
+## Inference Pipeline Evaluation (Feb 12)
 
 Ran `eval_inference.py` with v9 checkpoint. Results (5 val volumes, no surface splitting):
 
@@ -155,7 +154,7 @@ Best: **T_low=0.35, T_high=0.80 → 0.570**. T_high=0.85 was significantly worse
 
 ---
 
-## Overnight Pipeline (Feb 12, 2026)
+## Overnight Pipeline (Feb 12)
 
 The overnight automation script (`scripts/overnight_pipeline.sh`) ran:
 1. Wait for v10 training to complete — done ~02:12
@@ -251,3 +250,232 @@ Competition rules allow freely & publicly available external data including pre-
 - **PCIe instability (home machine):** RTX 5090 PCIe link crashed under sustained transfers.
   Mitigated with compact dtypes, no prefetching, smaller patches.
 - **imagecodecs needed:** Training TIFFs use LZW compression; tifffile requires imagecodecs.
+
+---
+
+## TransUNet Pivot (Feb 17-18)
+
+### Setup
+- Installed Keras 3 + medicai (from GitHub source — pip version is WRONG)
+- Downloaded 3 pretrained weight sets from Kaggle (see `TRANSUNET_SETUP.md`)
+- Verified: model loads, forward pass works, produces correct (1,160,160,160,3) output
+- Using `KERAS_BACKEND=torch` locally for PyTorch backend
+
+### TensorFlow GPU memory bug
+Keras 3 imports TensorFlow even with `KERAS_BACKEND=torch`. TF grabbed ~15 GiB GPU
+by default, causing OOM alongside PyTorch. Fix: `tf.config.set_visible_devices([], 'GPU')`
+at top of all scripts. Peak VRAM: 16.27 GB (fwd), 21.26 GB (fwd+bwd).
+
+### Metric downsample discovery
+METRIC_DOWNSAMPLE=4 inflates local scores by +0.16:
+
+| Downsample | Mean CompScore (5 vol) | Difference |
+|-----------|----------------------|-----------|
+| **ds=1 (full res, what Kaggle uses)** | **0.4113** | — |
+| ds=2 | 0.5039 | +0.093 |
+| ds=4 (what we'd been using) | 0.5700 | **+0.159** |
+
+Our "0.57 local val" was actually ~0.41 at full resolution. All future eval uses ds=1.
+
+### Kaggle TransUNet v20 (scored 0.504)
+Built dual-stream inference notebook based on Tony Li's 0.552 approach.
+**Public LB: 0.504** — +17% over previous best (0.431).
+
+Features: JAX backend, Keras 3, medicai offline wheels, dual-stream inference
+(public stream overlap=0.42 for argmax labels, private stream overlap=0.43/0.60),
+7-fold TTA, binary logit (logsumexp(L1,L2)-L0), seeded hysteresis, anisotropic closing.
+
+### Overnight 6-phase pipeline (completed Feb 18)
+82-vol validation, TTA, cross-scroll (30 vols), PP sweep (26 configs), exploration notebook.
+- Mean composite: 0.510 (82 vols, ds=1)
+- Cross-scroll: 0.544 (30 vols across 6 scrolls)
+- PP sweep: T_low=0.6 best (+0.0076), T_low is the only meaningful PP parameter
+- Results: `logs/overnight_transunet.log`, `logs/postprocessing_sweep.csv`
+
+### Adaptive T_low analysis (Feb 18)
+Swept 11 T_low values on 20 cross-scroll volumes.
+- Best fixed T_low=0.70 (comp=0.5324), NOT 0.60 from 82-vol val
+- Adaptive T_low not worthwhile (correlations too weak, best r=-0.539)
+- v21 uses T_low=0.70. Scored 0.504 (same as v20 — public test is 1 volume).
+
+---
+
+## Training Bug Investigation (Feb 19)
+
+### Critical: Normalization mismatch
+
+All previous fine-tuning runs degraded the model from comp=0.535 → 0.264-0.343. Found two bugs:
+
+**Bug 1 — Normalization mismatch (HIGH impact):**
+Training used `/255` normalization (range [0,1]), but eval/Kaggle use medicai's
+`NormalizeIntensity(nonzero=True)` — z-score normalization (range ~[-4, +7], mean=0).
+Head-to-head on baseline_v2: z-score eval comp=0.2828, /255 eval comp=0.4506.
+
+**Bug 2 — Intensity shift effectively zero (HIGH impact):**
+Shift of ±0.15 absolute on 0-255 data = ±0.0006 after /255 normalization = no augmentation.
+Fixed: ±0.10 in z-score space (matching competitor TPU notebook).
+
+**Fix (applied in baseline_v3):** Training now uses z-score normalization matching eval.
+
+### Pretrained model training chain
+The comboloss weights were trained in two stages by different people:
+1. **Stage 1 (TPU, Innat):** ImageNet encoder → 200 epochs at 128^3 with z-score + DiceCE + clDice
+2. **Stage 2 (GPU, 0537 notebook):** Fine-tuned for 25 epochs at 160^3 with /255 + DiceCE + SkeletonRecall + FP_Volume
+
+Model has seen both normalizations. Eval uses z-score (Stage 1), so training should too.
+
+### Training pipeline comparison vs competitor
+| Difference | Risk | Status |
+|---|---|---|
+| Normalization: /255 vs z-score | **HIGH** | **FIXED** |
+| Intensity shift: ~zero vs ±0.10 | **HIGH** | **FIXED** |
+| Validation: patch loss vs full-vol SWI | MEDIUM | Mitigated by checkpoint eval sweep |
+| FG-biased sampling: 50% vs none | MEDIUM | Keeping |
+| Effective batch: 4 vs 8 | MEDIUM | Keeping |
+| Loss, LR, optimizer, CutOut, mixed precision | OK | Matches competitor |
+
+### Disk cleanup (Feb 19)
+Deleted ~135 GB of broken checkpoints (all trained with wrong normalization):
+`data/refinement_data/` (94 GB), `checkpoints/transunet/` (13 GB),
+`transunet_thin_fp/` (11 GB), `transunet_thin_dist/` (11 GB),
+`transunet_baseline_v2/` (5.3 GB).
+
+---
+
+## TransUNet Fine-Tuning Campaign (Feb 19-22)
+
+### baseline_v3 (Feb 19) — normalization fix verified
+Training completed (25 epochs, ~4.5h). No catastrophic degradation — normalization fix worked.
+But none beat pretrained (0.5526).
+
+| Model | Comp | Topo | SDice | VOI |
+|-------|------|------|-------|-----|
+| pretrained | **0.5526** | **0.2353** | **0.8254** | 0.5517 |
+| ep5 | 0.5361 | 0.2148 | 0.7945 | 0.5532 |
+| ep10 | 0.5269 | 0.1961 | 0.7811 | **0.5562** |
+| ep15 | 0.5240 | 0.1901 | 0.7856 | 0.5487 |
+| ep20 | 0.5300 | 0.2057 | 0.7915 | 0.5463 |
+| ep25 | 0.5296 | 0.2045 | 0.7879 | 0.5499 |
+
+Results: `logs/eval_v3_results.csv`
+
+### Overnight 3-GPU sweep (Feb 19-20)
+All use z-score normalization, 25 epochs, checkpoints every 5, auto-eval.
+
+| GPU | Variant | Loss Config |
+|-----|---------|-------------|
+| gpu0 | dist_sq | skel=0.75, fp=1.5, dist=2.0, power=2.0 |
+| gpu1 | thin_fp | skel=0.75, fp=1.5, dist=0.0, power=1.0 |
+| gpu2 | dist_skel | skel=0.75, fp=1.5, dist=1.0, power=1.0 |
+
+Plus low-LR (5e-6) follow-ups auto-chained after each.
+
+### Phase 3: Discriminative LR + Frozen Encoder (Feb 20)
+
+| GPU | Experiment | Key Idea |
+|-----|-----------|----------|
+| gpu1 | Discriminative LR | enc=lr/100, vit=lr/10, dec=lr/10, head=lr |
+| gpu2 | Frozen encoder | Freeze SEResNeXt50+ViT, only train decoder+head |
+
+### All completed experiments summary (Feb 20-22)
+
+| Model | Best Comp | Best Topo | Best SDice | Notes |
+|-------|-----------|-----------|------------|-------|
+| frozen_boundary (gpu2) | 0.5408 (ep10) | **0.2642** (ep10) | 0.7871 (ep15) | Best individual topo |
+| frozen_dist_sq (gpu2) | 0.5402 (ep25) | 0.2634 (ep25) | 0.7885 (ep10) | Similar to frozen_boundary |
+| discrim_dist_sq (gpu1) | 0.5269 (ep25) | 0.2292 (ep15/25) | 0.7841 (ep25) | Worse than frozen |
+| discrim_boundary (gpu1) | 0.5286 (ep15) | 0.2342 (ep15) | 0.7836 (ep15) | Worse than frozen |
+
+**Key finding:** No fine-tuned model beats pretrained alone. All degrade SDice.
+Frozen encoder is consistently better than discriminative LR. SWA blending is the bridge.
+
+Results: `logs/eval_frozen_boundary_results.csv`, `logs/eval_frozen_dist_sq_results.csv`,
+`logs/eval_discrim_dist_sq_results.csv`, `logs/eval_discrim_boundary_results.csv`
+
+---
+
+## SWA Weight Averaging (Feb 20-21)
+
+### First SWA results (Feb 20)
+First approach to beat pretrained! Blending pretrained + fine-tuned weights.
+
+| Model | Comp | Topo | SDice | VOI |
+|-------|------|------|-------|-----|
+| pretrained (baseline) | 0.5526 | 0.2354 | 0.8255 | 0.5517 |
+| **swa_70pre_30distsq_ep5** | **0.5530** | **0.2462** | 0.8289 | 0.5401 |
+| swa_70pre_30lowlr_ep5 | 0.5518 | 0.2367 | 0.8296 | 0.5440 |
+| swa_50pre_50lowlr_ep5 | 0.5518 | 0.2467 | 0.8272 | 0.5378 |
+| swa_lowlr_late_avg | 0.5243 | 0.2276 | 0.7785 | 0.5244 |
+
+Key insight: fine-tuning learns useful signal, but only a small dose (30%) improves
+on pretrained without degrading SDice. Pure fine-tuned average is much worse.
+
+Results: `logs/eval_swa_results.csv`, Weights: `checkpoints/swa/`
+
+### Topo-focused blending (Feb 21) — New best model
+Blending pretrained with frozen_boundary checkpoints (best individual topo scores).
+
+| Model | Comp | Topo | SDice | VOI |
+|-------|------|------|-------|-----|
+| pretrained (baseline) | 0.5526 | 0.2354 | 0.8255 | 0.5517 |
+| swa_90pre_10topo (ep10) | 0.5544 | 0.2403 | 0.8285 | 0.5496 |
+| swa_80pre_20topo (ep10) | 0.5531 | 0.2396 | 0.8300 | 0.5450 |
+| swa_70pre_30topo (ep10) | 0.5545 | 0.2490 | 0.8301 | 0.5407 |
+| swa_60pre_40topo (ep10) | 0.5541 | 0.2507 | 0.8287 | 0.5395 |
+| **swa_70pre_30topo_ep5** | **0.5549** | 0.2499 | 0.8291 | 0.5420 |
+| swa_70pre_30sdice_ep15 | 0.5548 | 0.2489 | 0.8301 | 0.5418 |
+
+**New overall best: swa_70pre_30topo_ep5 at comp=0.5549** (+0.0023 over pretrained).
+All 6 blends beat pretrained. 70/30 ratio is the sweet spot.
+
+Results: `logs/eval_swa_topo_results.csv`, Weights: `checkpoints/swa_topo/`
+
+---
+
+## PP Sweep on dist_sq Probmaps (Feb 20)
+
+26 configs on dist_sq_ep5 probmaps. Key findings:
+- T_low is the only meaningful PP parameter. Everything else is noise (±0.001).
+- dist_sq optimal T_low=0.30-0.40 (vs pretrained's 0.70) — thinner predictions need lower threshold
+- PP barely helps fine-tuned models (best config 0.506 vs pretrained's 0.553 — gap is in the model)
+- Results: `logs/postprocessing_sweep.csv`
+
+---
+
+## Multi-Model Comparison Notebook (Feb 21)
+
+Visual exploration comparing top models: pretrained, swa_70pre_30distsq, frozen_boundary_ep10, dist_sq_ep5.
+Sections: score summary, cross-sections, probability distributions, thickness analysis, SDice deep dive,
+connected components, PP sensitivity analysis.
+- Notebook: `notebooks/analysis/multi_model_comparison.ipynb`
+- Fixed uint8 bitwise NOT bug in SDice analysis (`~uint8(0)=255`, not `False` — breaks EDT)
+
+---
+
+## Prediction Thickness Investigation (Feb 18-20)
+
+**Problem:** Model predicts 15-30% foreground per volume vs GT's 2-8%.
+Surfaces are 3-5x too thick. This is the single biggest scoring problem.
+
+**Impact on each metric:**
+- **SDice (35%):** Thick predictions create two boundary surfaces (top+bottom). One aligns with GT, the other is penalized.
+- **VOI (35%):** Excess voxels increase conditional entropy. Thickness merges nearby surfaces.
+- **Topo (30%):** Merged surfaces change component count and create false tunnels.
+
+**Root cause:** The probmaps themselves are too thick (model-level, not PP artifact).
+
+**Training approaches tried:**
+- dist_sq loss (quadratic penalty far from skeleton) — partial improvement
+- Frozen encoder + dist_sq — best individual topo but degrades SDice
+- clDice — needs 48GB VRAM for soft-skeletonization
+
+**PP thinning verdict:** Ridge extraction destroys topology (topo 0.29→0.005).
+Post-processing should reconnect fragments, not thin. Model must learn thinness.
+
+---
+
+## Refinement Model (ABANDONED)
+
+Approached abandoned in favor of TransUNet pivot.
+- Phase 2 result: delta -0.0298 vs baseline. Improves topo+sdice but destroys VOI.
+- Per-voxel refinement fragments predictions — need component-level approach instead.

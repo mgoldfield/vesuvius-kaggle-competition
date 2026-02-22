@@ -227,47 +227,62 @@ def main():
     # Process volumes
     t_global = time.time()
     total_bytes = 0
+    failed_vids = []
 
     for i, vid in enumerate(vol_ids):
         t0 = time.time()
         gpu_cleanup()
 
-        # Load and normalize
-        img = tifffile.imread(TRAIN_IMG / f"{vid}.tif").astype(np.float32)
-        vol_5d = img[None, ..., None]
-        del img
-        vol_5d = normalize_volume(vol_5d)
+        try:
+            # Load and normalize
+            img = tifffile.imread(TRAIN_IMG / f"{vid}.tif").astype(np.float32)
+            vol_5d = img[None, ..., None]
+            del img
+            vol_5d = normalize_volume(vol_5d)
 
-        # Inference
-        with torch.no_grad():
-            prob = predict_volume(model, swi, vol_5d, use_tta=args.tta)
-        del vol_5d
-        gpu_cleanup()
+            # Inference
+            with torch.no_grad():
+                prob = predict_volume(model, swi, vol_5d, use_tta=args.tta)
+            del vol_5d
+            gpu_cleanup()
 
-        # Save
-        out_path = output_dir / f"{vid}.npy"
-        prob_f16 = prob.astype(np.float16)
-        np.save(out_path, prob_f16)
-        file_size = out_path.stat().st_size
-        total_bytes += file_size
+            # Save
+            out_path = output_dir / f"{vid}.npy"
+            prob_f16 = prob.astype(np.float16)
+            np.save(out_path, prob_f16)
+            file_size = out_path.stat().st_size
+            total_bytes += file_size
 
-        elapsed = time.time() - t0
-        total_elapsed = time.time() - t_global
-        eta_min = (total_elapsed / (i + 1)) * (len(vol_ids) - i - 1) / 60
+            elapsed = time.time() - t0
+            total_elapsed = time.time() - t_global
+            n_done = i + 1 - len(failed_vids)
+            eta_min = (total_elapsed / max(n_done, 1)) * (len(vol_ids) - i - 1) / 60 if n_done > 0 else 0
 
-        scroll_id = train_df[train_df.id == vid].scroll_id.values[0]
-        print(f"[{i+1}/{len(vol_ids)}] vol={vid} scroll={scroll_id} | "
-              f"shape={prob.shape} prob_max={prob.max():.3f} | "
-              f"{file_size/1e6:.1f}MB | {elapsed:.0f}s (ETA {eta_min:.1f}min)")
+            scroll_id = train_df[train_df.id == vid].scroll_id.values[0]
+            print(f"[{i+1}/{len(vol_ids)}] vol={vid} scroll={scroll_id} | "
+                  f"shape={prob.shape} prob_max={prob.max():.3f} | "
+                  f"{file_size/1e6:.1f}MB | {elapsed:.0f}s (ETA {eta_min:.1f}min)")
 
-        del prob, prob_f16
+            del prob, prob_f16
+
+        except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
+            # CUDA OOM or other runtime errors — skip this volume and continue
+            scroll_id = train_df[train_df.id == vid].scroll_id.values[0]
+            print(f"[{i+1}/{len(vol_ids)}] vol={vid} scroll={scroll_id} | "
+                  f"SKIPPED — {type(e).__name__}: {e}")
+            failed_vids.append(vid)
+            gpu_cleanup()
+            continue
 
     total_elapsed = time.time() - t_global
+    n_success = len(vol_ids) - len(failed_vids)
     print(f"\n=== Done ===")
-    print(f"  Volumes processed: {len(vol_ids)}")
+    print(f"  Volumes processed: {n_success}/{len(vol_ids)}")
+    if failed_vids:
+        print(f"  Failed volumes ({len(failed_vids)}): {failed_vids}")
     print(f"  Total size: {total_bytes / 1e9:.1f} GB")
     print(f"  Total time: {total_elapsed / 60:.1f} min ({total_elapsed / 3600:.1f} hrs)")
-    print(f"  Avg per volume: {total_elapsed / max(len(vol_ids), 1):.0f}s")
+    print(f"  Avg per volume: {total_elapsed / max(n_success, 1):.0f}s")
     print(f"  Output: {output_dir}")
 
 
