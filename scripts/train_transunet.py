@@ -455,10 +455,10 @@ def main():
         component_prefixes = {
             'cnn': ('conv1', 'pool1', 'stack'),
             'vit': ('transunet_vit',),
-            'decoder': ('transunet_masked', 'transunet_mlp', 'cnn_feature',
+            'decoder': ('masked_xattn_level', 'proj_cnn',
                         'learnable_queries', 'class_prediction'),
             'queries': ('learnable_queries',),
-            'head': ('unet_decoder', 'final_conv', 'segmentation'),
+            'head': ('decoder_proj', 'decoder_conv', 'final_conv'),
         }
 
         unfreeze_prefixes = []

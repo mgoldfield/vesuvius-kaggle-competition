@@ -24,7 +24,7 @@ for active decision-making — keep this file lean.
 | **gpu0** (this machine) | RTX 5090 32GB | local | Primary control. Probmap generation + PP sweep. |
 | **gpu1** (new) | RTX 6000 Ada 48GB | `ssh -i ~/.ssh/remote-gpu root@195.26.233.34 -p 39422` | Pseudo-label training WITHOUT clDice (control). |
 | **gpu2** | RTX 6000 Ada 48GB | `ssh -i ~/.ssh/remote-gpu root@195.26.233.87 -p 25763` | Round-2 pseudo-labeling pipeline. |
-| **gpu3** (new) | RTX 6000 Ada 48GB | `ssh -i ~/.ssh/remote-gpu root@195.26.233.74 -p 54496` | Selective unfreeze: ViT + clDice. |
+| **gpu3** (new) | RTX 6000 Ada 48GB | `ssh -i ~/.ssh/remote-gpu root@195.26.233.74 -p 32327` | Selective unfreeze: ViT + clDice. |
 | **gpu4** (new) | RTX 6000 Ada 48GB | `ssh -i ~/.ssh/remote-gpu root@195.26.233.43 -p 52276` | Selective unfreeze: decoder + margin dist. |
 
 - Old gpu1 (RTX 5090): **decommissioned** Feb 22. All data synced to gpu0.
@@ -169,52 +169,44 @@ T_low sweeps running overnight on 20 volumes. If confirmed:
 - Kaggle notebook hardening, timing, error handling
 - Final submissions with buffer for Kaggle queue
 
-## Current Status (Feb 23, ~05:15 UTC)
+## Current Status (Feb 23, ~12:30 PM EST / 17:30 UTC)
 
-### Monitoring
-Background monitor checks all tasks every 5 min. Latest: `cat /tmp/monitor_status.log`
-History: `/tmp/monitor_history.log`
-Monitor PID: 3376328 | Script: `/tmp/monitor_overnight.sh`
-Tracks: gpu0 eval, T_low sweeps, gpu1 training, gpu2 round-2, gpu3/gpu4 unfreeze experiments, Kaggle.
+### gpu2 pseudo_frozen_margin_dist — EVAL COMPLETE
 
-### Overnight Automation & Recovery Notes
+| Epoch | Comp (standalone) | SDice | Notes |
+|-------|------------------|-------|-------|
+| ep5 | OOM'd during eval | — | |
+| ep10 | 0.5543 | 0.8294 | |
+| **ep15** | **0.5559** | **0.8308** | Best standalone |
+| ep20 | 0.5550 | 0.8304 | |
+| ep25 | 0.5552 | 0.8307 | |
+| SWA 70/30 ep15 | 0.5542 | — | Below current best (0.5551) |
+| SWA 70/30 ep5 | EVAL QUEUED | — | Created, needs eval |
 
-**If anything below fails, these notes provide full context to recover.**
+### T_low PP sweeps — NEARLY DONE (51/59 configs)
 
-#### 1. gpu0 eval chain — SWA blend fix script
+Both 20-vol sweeps are at 51/59 configs. Results are conclusive — remaining 8 are C_2pass
+variants (all 0.49-0.52, clearly worse). Best PP configs confirmed:
 
-**Problem:** The eval chain (`/tmp/eval_gpu2_and_blend.sh`) has a bug — it extracts comp with
-`grep -oP 'comp_score=\K'` but the actual format is `comp_score: 0.5543` (colon not equals).
-So BEST_EP stays empty and PHASE 2 (SWA blend) gets skipped.
+| Probmaps | Best Config | Comp | vs base_tl0.70 |
+|----------|-------------|------|----------------|
+| SWA val | close_erode_tl0.40_c2_e1 | 0.5368 | +0.0018 |
+| Margin dist blend | erode_tl0.40_e1 | 0.5370 | +0.0014 |
 
-**Fix:** A follow-up script (`/tmp/fix_eval_swa_blend.sh`, PID 3378160) is running in background.
-It waits for the eval chain to finish, parses actual comp scores from the log using `awk`,
-picks the best checkpoint, then runs SWA blend + eval.
+**Conclusion:** erode_tl0.40_e1 is the best PP config. Improvement is real but small (+0.001-0.002).
+Close_erode and plain erode are nearly identical. The 2-vol dry-run (0.5595) was misleadingly
+optimistic — on 20 vols the improvement shrinks substantially.
 
-**Partial results so far:**
-- ep10: comp=0.5543
-- ep15: comp=0.5559
-- ep20, ep25: evaluating
+### Kaggle: All submissions score 0.504
 
-**If the fix script fails, manually run:**
-```bash
-# 1. Find best epoch from log
-grep "comp_score:" logs/eval_gpu2_margin_dist.log
-# 2. SWA blend (replace EP with best epoch number)
-/workspace/venv/bin/python3 scripts/swa_average.py \
-  --weights pretrained_weights/transunet/transunet.seresnext50.160px.comboloss.weights.h5 \
-  checkpoints/transunet_pseudo_frozen_margin_dist/transunet_epEP.weights.h5 \
-  --ratios 0.70 0.30 --output checkpoints/swa_topo/swa_70pre_30pseudo_margin_dist_epEP.weights.h5
-# 3. Eval the blend
-/workspace/venv/bin/python3 scripts/eval_transunet.py --weights checkpoints/swa_topo/swa_70pre_30pseudo_margin_dist_epEP.weights.h5 --cross-scroll --max-per-scroll 4 --t-low 0.70 --t-high 0.90
-```
+v22 (SWA best) and v24 (margin_dist blend + close_erode PP) both scored 0.504. Public LB
+is unreliable (1 test volume). We should keep submitting our best local val models.
 
-#### 2. gpu3 — Chained selective unfreeze ViT experiments
+#### 2. gpu3 — RESTARTED (new SSH port: 32327)
 
-**SSH:** `ssh -o StrictHostKeyChecking=no -i ~/.ssh/remote-gpu root@195.26.233.74 -p 54496`
-**Tmux:** `train` session
+**SSH:** `ssh -o StrictHostKeyChecking=no -i ~/.ssh/remote-gpu root@195.26.233.74 -p 32327`
 
-**Chain script:** `/workspace/vesuvius-kaggle-competition/launch_gpu3_chain.sh` runs two experiments back-to-back:
+**Experiments that were running:**
 
 **Exp 1:** `launch_gpu3_unfreeze_vit.sh` — ViT-only, pure clDice
 - Unfreeze: vit (~25M params) | LR: 1e-5 | 15 epochs
@@ -355,22 +347,22 @@ ETA: results by ~14:00-17:00 UTC (9 AM - 12 PM ET)
 
 Pretrained sweep still in progress. Log: `logs/connectivity_pp_pretrained_sweep.log`
 
-### gpu1: pseudo_margin2_cldice — TRAINING (ep 2/25)
+### gpu1: DUAL — pseudo_margin2_cldice DONE + unfreeze_vit_highLR RUNNING
 
-Relaunched after OOM fix. Ep 2/25 at 03:50 UTC, loss=0.965. Stable at 34.7/49.1 GB VRAM.
-Config: frozen encoder, SWA weights, pseudo-labels, margin dist (margin=2, power=2, w=0.02),
-clDice=0.3 (iters=5), boundary=0.3. 25 epochs, save every 5.
-ETA: ~11:00 UTC (6 AM ET). Pull + eval when done.
+**pseudo_margin2_cldice** — COMPLETE (25/25 epochs, 8.6 hours).
+Checkpoints pulled to gpu0 (ep5/10/15/20/25). Evaluating ep5 now on gpu0.
+
+**unfreeze_vit_highLR** — RUNNING (ep 1/15, launched 17:22 UTC).
+Config: ViT unfreeze (26.3M params), LR=1e-4, balanced loss (cldice=1.5, skel=0.75, fp=0.50,
+boundary=0.3). 15 epochs, ~2.2 hr/epoch. ETA: ~Feb 24 ~02:00 EST.
 **SSH:** `ssh -i ~/.ssh/remote-gpu root@195.26.233.34 -p 39422`
 
-### gpu2: Round-2 pseudo-labeling pipeline — RUNNING
+### gpu2: Round-2 resume training — RUNNING (ep 2/20)
 
-Iterative pseudo-labeling: use clDice ep20 (best SDice) as teacher for sharper pseudo-labels.
-Tmux session: `round2` | Log: `logs/pseudo_r2_cldice.log`
-1. Generate round-2 probmaps (704 volumes, ~16s/vol) — RUNNING (15/704, ETA ~07:15 UTC)
-2. Create round-2 pseudo-labels — queued (~30 min)
-3. Train round-2 model (25 epochs, cldice=0.5, boundary=0.3) — queued (ETA start ~08:00 UTC)
-Training config: frozen encoder, SWA init, cldice=0.5, boundary=0.3, cldice-iters=5.
+Round-2 training resumed from ep5 checkpoint with reduced cldice-iters=3 (was 5, OOM'd).
+Tmux session: `round2` | Log: `logs/pseudo_r2_cldice_resume.log`
+Config: frozen encoder, SWA init, cldice=0.5, cldice-iters=3, boundary=0.3, fp=1.5, skel=0.75.
+**WARNING:** val_loss=nan on ep1. Monitor for stability.
 **SSH:** `ssh -i ~/.ssh/remote-gpu root@195.26.233.87 -p 25763`
 
 ### Competition scores

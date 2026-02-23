@@ -130,7 +130,8 @@
       "Bash(tmux capture-pane:*)",
       "Bash(KAGGLE_USERNAME=mgoldfield KAGGLE_KEY=f213f3539b5bb35dbeb9770f1e665e40 kaggle kernels status:*)",
       "Bash(TF_CPP_MIN_LOG_LEVEL=3 python:*)",
-      "Bash(sort:*)"
+      "Bash(sort:*)",
+      "Bash(timeout 5 bash:*)"
     ]
   }
 }
