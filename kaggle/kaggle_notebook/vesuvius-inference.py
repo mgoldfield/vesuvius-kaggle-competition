@@ -56,8 +56,8 @@ print(f"Keras backend: {keras.config.backend()}, version: {keras.version()}")
 
 # ── Configuration ─────────────────────────────────────────
 CFG = dict(
-    # Model weights (comboloss, LB 0.545 as single-stream)
-    weights_path="/kaggle/input/vesuvius-unet3d-weights/transunet.seresnext50.160px.comboloss.weights.h5",
+    # Model weights (SWA 70/30 pretrained/margin_dist blend, local val 0.5551)
+    weights_path="/kaggle/input/vesuvius-unet3d-weights/swa_70pre_30margin_dist_ep5.weights.h5",
 
     # SWI overlaps: dual-stream (Tony Li's 0.552 approach)
     overlap_public=0.42,   # public stream (argmax labels)
@@ -68,16 +68,20 @@ CFG = dict(
     # TTA: 7-fold (identity + 3 flips + 3 rotations)
     USE_TTA=True,
 
+    # Adaptive TTA timer
+    TIME_BUDGET_SEC=9 * 3600,     # 9 hour Kaggle limit
+    BUFFER_SEC=15 * 60,           # 15 min safety buffer for ZIP + overhead
+
     # Binary logit mode: fg12 = logsumexp(L1, L2) - L0
     INK_MODE="fg12",
 
-    # Hysteresis thresholds
-    T_low=0.70,
+    # Hysteresis thresholds (T_low=0.40 + close_erode PP, local val 0.5595)
+    T_low=0.40,
     T_high=0.90,
 
-    # Closing and dust removal
-    z_radius=3,
-    xy_radius=2,
+    # Close-erode post-processing: closing bridges gaps, erosion thins back
+    closing_iters=1,       # face-connected binary closing iterations
+    erosion_iters=1,       # face-connected binary erosion iterations
     dust_min_size=100,
 
     # Warmup (JAX JIT compilation)
@@ -137,41 +141,12 @@ def binary_logit_from_multiclass_logits(logits_5d, mode="fg12"):
         raise ValueError(f"Unknown INK_MODE={mode}")
 
 # ── Post-processing helpers ───────────────────────────────
-def build_anisotropic_struct(z_radius, xy_radius):
-    z, r = int(z_radius), int(xy_radius)
-    if z == 0 and r == 0:
-        return None
-    if z == 0 and r > 0:
-        size = 2 * r + 1
-        struct = np.zeros((1, size, size), dtype=bool)
-        cy = cx = r
-        for dy in range(-r, r + 1):
-            for dx in range(-r, r + 1):
-                if dy * dy + dx * dx <= r * r:
-                    struct[0, cy + dy, cx + dx] = True
-        return struct
-    if z > 0 and r == 0:
-        struct = np.zeros((2 * z + 1, 1, 1), dtype=bool)
-        struct[:, 0, 0] = True
-        return struct
-    depth = 2 * z + 1
-    size = 2 * r + 1
-    struct = np.zeros((depth, size, size), dtype=bool)
-    cz = z
-    cy = cx = r
-    for dz in range(-z, z + 1):
-        for dy in range(-r, r + 1):
-            for dx in range(-r, r + 1):
-                if dy * dy + dx * dx <= r * r:
-                    struct[cz + dz, cy + dy, cx + dx] = True
-    return struct
-
-def seeded_hysteresis_with_topology(
+def seeded_hysteresis_close_erode(
     prob, pub_fg_bool,
-    T_low=0.70, T_high=0.90,
-    z_radius=3, xy_radius=2, dust_min_size=100,
+    T_low=0.40, T_high=0.90,
+    closing_iters=1, erosion_iters=1, dust_min_size=100,
 ):
-    """Seeded hysteresis with public-stream weak region expansion."""
+    """Seeded hysteresis + close_erode: closing bridges gaps, erosion thins back."""
     prob = np.asarray(prob, dtype=np.float32)
     strong = prob >= float(T_high)
 
@@ -181,15 +156,20 @@ def seeded_hysteresis_with_topology(
     if not strong.any():
         return np.zeros_like(prob, dtype=np.uint8)
 
-    struct_hyst = ndi.generate_binary_structure(3, 3)
-    mask = ndi.binary_propagation(strong, mask=weak, structure=struct_hyst)
+    struct_full = ndi.generate_binary_structure(3, 3)  # full connectivity for hysteresis
+    mask = ndi.binary_propagation(strong, mask=weak, structure=struct_full)
 
     if not mask.any():
         return np.zeros_like(prob, dtype=np.uint8)
 
-    struct_close = build_anisotropic_struct(z_radius, xy_radius)
-    if struct_close is not None:
-        mask = ndi.binary_closing(mask, structure=struct_close)
+    # Close-erode: face-connected structuring element
+    struct_face = ndi.generate_binary_structure(3, 1)  # face-connected (6-neighbor)
+
+    if closing_iters > 0:
+        mask = ndi.binary_closing(mask, structure=struct_face, iterations=closing_iters)
+
+    if erosion_iters > 0:
+        mask = ndi.binary_erosion(mask, structure=struct_face, iterations=erosion_iters)
 
     if int(dust_min_size) > 0:
         mask = remove_small_objects(mask.astype(bool), min_size=int(dust_min_size))
@@ -197,16 +177,30 @@ def seeded_hysteresis_with_topology(
     return mask.astype(np.uint8)
 
 # ── TTA augmentations ─────────────────────────────────────
-def iter_tta(volume):
-    """Generate 7 TTA augmentations: identity + 3 flips + 3 rotations."""
+TTA_LEVEL_NAMES = {3: "7-fold", 2: "4-fold (rotations)", 1: "identity-only"}
+TTA_LEVEL_VIEWS = {3: 7, 2: 4, 1: 1}
+
+def iter_tta(volume, level=3):
+    """Generate TTA augmentations based on level.
+    Level 3: identity + 3 flips + 3 rotations = 7 views (full quality)
+    Level 2: identity + 3 rotations = 4 views (drop flips for speed)
+    Level 1: identity only = 1 view (fastest)
+    """
+    # Identity (always included)
     yield volume, (lambda y: y)
-    for axis in [1, 2, 3]:
-        v = np.flip(volume, axis=axis)
-        inv = (lambda y, axis=axis: np.flip(y, axis=axis))
-        yield v, inv
+    if level <= 1:
+        return
+    # Rotations (levels 2 and 3)
     for k in [1, 2, 3]:
         v = np.rot90(volume, k=k, axes=(2, 3))
         inv = (lambda y, k=k: np.rot90(y, k=-k, axes=(2, 3)))
+        yield v, inv
+    if level <= 2:
+        return
+    # Flips (level 3 only)
+    for axis in [1, 2, 3]:
+        v = np.flip(volume, axis=axis)
+        inv = (lambda y, axis=axis: np.flip(y, axis=axis))
         yield v, inv
 
 # ── Model + SWI setup ─────────────────────────────────────
@@ -235,15 +229,16 @@ swi_base = build_swi(CFG["overlap_base"])      # private stream (TTA augs)
 swi_hi = build_swi(CFG["overlap_hi"])          # private stream (identity)
 
 # ── Dual-stream prediction ────────────────────────────────
-def predict_pub_labels_and_private_prob(volume):
+def predict_pub_labels_and_private_prob(volume, tta_level=3):
     """
     Dual-stream inference:
     - Public stream: average multiclass logits -> argmax labels
     - Private stream: average binary logits -> probability
+    tta_level: 3=7-fold, 2=4-fold (rotations), 1=identity only
     """
     mode = CFG["INK_MODE"]
 
-    if not CFG["USE_TTA"]:
+    if not CFG["USE_TTA"] or tta_level <= 0:
         l_pub = np.asarray(swi_public(volume))
         pub_labels = l_pub.argmax(-1).astype(np.uint8).squeeze()
         l_prv = np.asarray(swi_hi(volume))
@@ -255,7 +250,7 @@ def predict_pub_labels_and_private_prob(volume):
     s_sum = None
     n = 0
 
-    for t, (v, inv) in enumerate(iter_tta(volume)):
+    for t, (v, inv) in enumerate(iter_tta(volume, level=tta_level)):
         # Public stream
         l_pub = np.asarray(swi_public(v))
         l_pub = inv(l_pub)
@@ -295,9 +290,14 @@ print(f"\nConfig: overlap_public={CFG['overlap_public']}, overlap_base={CFG['ove
 print(f"INK_MODE={CFG['INK_MODE']}, T_low={CFG['T_low']}, T_high={CFG['T_high']}")
 print(f"TTA={'ON (7-fold)' if CFG['USE_TTA'] else 'OFF'}, "
       f"OV06_MAIN_ONLY={CFG['OV06_MAIN_ONLY']}")
-print(f"Closing: z={CFG['z_radius']}, xy={CFG['xy_radius']}, dust={CFG['dust_min_size']}")
+print(f"PP: close_erode (close={CFG['closing_iters']}, erode={CFG['erosion_iters']}), dust={CFG['dust_min_size']}")
+print(f"Time budget: {CFG['TIME_BUDGET_SEC']/3600:.1f}h, "
+      f"buffer: {CFG['BUFFER_SEC']/60:.0f}min")
 
 t_global0 = time.perf_counter()
+tta_level = 3           # start at full 7-fold TTA
+vol_times = []          # track per-volume times for ETA estimation
+total_vols = len(ids)
 
 with zipfile.ZipFile(ZIP_PATH, "w", compression=zipfile.ZIP_DEFLATED) as zf:
     for i, image_id in enumerate(ids):
@@ -310,19 +310,21 @@ with zipfile.ZipFile(ZIP_PATH, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         if i == 0 and CFG["DO_WARMUP"]:
             warmup(volume)
 
-        pub_labels, prob = predict_pub_labels_and_private_prob(volume)
+        pub_labels, prob = predict_pub_labels_and_private_prob(
+            volume, tta_level=tta_level
+        )
 
         # Public foreground anchor (weak region expansion)
         pub_fg = (pub_labels != 0)
 
-        # Seeded hysteresis + closing + dust removal
-        output = seeded_hysteresis_with_topology(
+        # Seeded hysteresis + close_erode PP
+        output = seeded_hysteresis_close_erode(
             prob,
             pub_fg_bool=pub_fg,
             T_low=CFG["T_low"],
             T_high=CFG["T_high"],
-            z_radius=CFG["z_radius"],
-            xy_radius=CFG["xy_radius"],
+            closing_iters=CFG["closing_iters"],
+            erosion_iters=CFG["erosion_iters"],
             dust_min_size=CFG["dust_min_size"],
         )
 
@@ -333,9 +335,46 @@ with zipfile.ZipFile(ZIP_PATH, "w", compression=zipfile.ZIP_DEFLATED) as zf:
 
         dt = time.perf_counter() - t0
         elapsed = time.perf_counter() - t_global0
-        print(f"[{i+1}/{len(ids)}] id={image_id} | {dt/60:.2f} min | "
-              f"elapsed {elapsed/3600:.2f} h | positives={int(output.sum())}")
+        vol_times.append(dt)
+        remaining_vols = total_vols - (i + 1)
+
+        # ── Adaptive TTA timer ──
+        status = "OK"
+        if remaining_vols > 0:
+            # Rolling average of last 5 volumes for ETA (adapts to level changes)
+            recent = vol_times[-5:]
+            avg_time = sum(recent) / len(recent)
+            time_needed = remaining_vols * avg_time
+            time_available = CFG["TIME_BUDGET_SEC"] - CFG["BUFFER_SEC"] - elapsed
+
+            if time_needed > time_available and tta_level > 1:
+                old_level = tta_level
+                if tta_level == 3:
+                    tta_level = 2
+                    # Re-estimate: 4/7 of current average
+                    est_new_avg = avg_time * (4 / 7)
+                elif tta_level == 2:
+                    tta_level = 1
+                    # Re-estimate: 1/4 of current average
+                    est_new_avg = avg_time * (1 / 4)
+                # Check if reduction is enough, otherwise drop further
+                if remaining_vols * est_new_avg > time_available and tta_level > 1:
+                    tta_level = 1
+                status = f"REDUCED TTA {old_level}->{tta_level}"
+                print(f"  [TIMER] {status} ({TTA_LEVEL_NAMES[tta_level]}). "
+                      f"Need {time_needed/60:.0f}min, have {time_available/60:.0f}min")
+
+            eta_min = (elapsed + remaining_vols * avg_time) / 60
+        else:
+            eta_min = elapsed / 60
+
+        print(f"[{i+1}/{total_vols}] id={image_id} | {dt/60:.1f}min | "
+              f"TTA={TTA_LEVEL_VIEWS[tta_level]} | "
+              f"elapsed {elapsed/3600:.2f}h | "
+              f"ETA {eta_min/60:.2f}h | {status}")
 
 print(f"\nSubmission ZIP: {ZIP_PATH}")
 total_time = time.perf_counter() - t_global0
 print(f"Total time: {total_time/3600:.2f} hours")
+print(f"Final TTA level: {tta_level} ({TTA_LEVEL_NAMES[tta_level]})")
+print(f"Volumes processed: {total_vols}")

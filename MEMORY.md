@@ -60,6 +60,19 @@ better than my initial approach of post-processing-only thinning.
 - **User values visual data exploration.** When asked to build notebooks, include
   `%matplotlib inline` for rendering. Use the venv kernel (`vesuvius`) for execution.
   Papermill works for background execution.
+- **Test bash scripts for arg correctness before deploying.** grep argparse
+  definitions to verify flags exist rather than running --help (which imports
+  heavy libs and is slow). Cross-check extracted flags from scripts against
+  parser definitions.
+- **Bash grep patterns in eval scripts break easily.** The eval chain used
+  `comp_score=` but actual format was `comp_score:`. Always check the actual
+  output format when writing extraction patterns. Build fix scripts to run
+  after buggy chains rather than trying to kill/restart mid-run.
+- **User prefers balanced loss functions over pure/isolated ones.** When
+  proposing ablation experiments, the user's instinct is to keep all existing
+  loss components and heavily weight the new one, rather than zeroing everything
+  else. This often yields better results since the model retains stability.
+- **Give ETAs in EST, not UTC.** User is on US East Coast.
 
 ## Project Approach
 
@@ -72,26 +85,30 @@ alignment). The fix is two-pronged:
 The user prioritizes understanding the problem deeply over running many experiments.
 They'd rather run 3 well-motivated experiments than 10 random ones.
 
-## Current State (Feb 22, ~06:00 UTC)
+## Current State (Feb 23, ~00:15 AM EST)
 
-**Best model:** swa_70pre_30topo_ep5 (comp=0.5549). SWA blending is the winning
+**Best model:** swa_70pre_30margin_dist_ep5 (comp=0.5551). SWA blending is the winning
 strategy — no single fine-tuned model beats pretrained, but 70/30 blends consistently do.
 
-**Active experiments:**
-- gpu0: Connectivity PP sweep running on SWA probmaps (43 configs, 82 vols). Probmaps done.
-  After SWA sweep → pretrained sweep automatically. ~4 hrs total.
-- gpu1 (RTX 6000 Ada 48GB): Setting up — installing packages, data transfer 89% done.
-  Pseudo-label training WITHOUT clDice (control). Needs user approval to launch.
-- gpu2 (RTX 6000 Ada 48GB): Pseudo-label training WITH clDice running (iters=10).
-  Ep1 step 400/704, ~20 min/epoch, ETA ~14:00 UTC for all 25 epochs. 46.7/49.1 GB VRAM.
-- Kaggle v22 score still PENDING.
+**Key innovation this session:** Selective component unfreezing — `--unfreeze` flag added
+to train_transunet.py. Can now train just the ViT (connectivity) or just the decoder
+(boundary precision) with targeted loss functions. User proposed this approach and also
+the insight that balanced losses (keeping skel+fp defaults while heavily weighting the
+new targeted loss) are better than pure isolation.
 
-**Key context:**
-- gpu2 SSH IP changed: now `root@195.26.233.87 -p 25763` (old IP timed out).
-- Pseudo-label training OOM'd on gpu0 (32GB). Denser pseudo-labels need >32GB GPU.
-- User wants approval before launching any new processes (in CLAUDE.md).
-- Connectivity PP sweep is DIFFERENT from the earlier standard PP sweep — tests
-  gap filling, dilate-merge-erode, two-pass hysteresis, and combined methods.
-- User is a night owl, may go to sleep soon and return ~1-2 PM ET (~18:00-19:00 UTC).
+**Active experiments (5 GPUs):**
+- gpu0: Eval chain for gpu2 checkpoints (ep10=0.5543, ep15=0.5559) + T_low sweeps (20 vol)
+- gpu1: pseudo_margin2_cldice training ep 5/25
+- gpu2: Round-2 iterative pseudo-labeling (probmaps 205/704)
+- gpu3: Setting up — ViT unfreeze chain (pure clDice → balanced clDice)
+- gpu4: Setting up — Decoder unfreeze chain (pure margin dist → balanced margin dist)
 
-**GPU status:** gpu0 (local) + gpu1 + gpu2, all active. Old gpu1 decommissioned.
+**Strategic priorities (agreed with user):**
+1. Confirm close_erode PP with 20-vol T_low sweep → re-evaluate models
+2. Pick best model from eval results + SWA blends → submit
+3. Selective component unfreezing experiments (gpu3/gpu4)
+4. Iterative pseudo-labeling (round 2, gpu2)
+5. Train on all 786 volumes for final submission
+
+**GPU fleet:** gpu0 (RTX 5090) + gpu1-4 (RTX 6000 Ada ×4). All active.
+SSH key for remotes: `~/.ssh/remote-gpu`. See NOTES.md hardware table for details.

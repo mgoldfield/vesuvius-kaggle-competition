@@ -201,6 +201,32 @@ def combined_method(prob, t_low_strict=0.80, t_high=0.90,
 
 # ── Baseline: standard hysteresis + closing ──────────────
 
+def thin_erode(prob, t_low=0.50, t_high=0.90, erosion_iters=1, dust=100):
+    """
+    Low threshold → thick connected mask → erode to thin.
+    The idea: capture connectivity at low T_low, then thin with erosion.
+    """
+    mask = hysteresis(prob, t_low, t_high)
+    struct = generate_binary_structure(3, 1)  # 6-connected
+    mask = binary_erosion(mask, struct, iterations=erosion_iters)
+    remove_dust(mask, dust)
+    return mask.astype(np.uint8)
+
+
+def thin_closing_erode(prob, t_low=0.50, t_high=0.90, closing_r=1,
+                       erosion_iters=1, dust=100):
+    """
+    Low threshold → close gaps → erode to thin.
+    Closing connects nearby fragments, erosion removes thickness.
+    """
+    mask = hysteresis(prob, t_low, t_high)
+    struct = generate_binary_structure(3, 1)  # 6-connected
+    mask = binary_closing(mask, struct, iterations=closing_r)
+    mask = binary_erosion(mask, struct, iterations=erosion_iters)
+    remove_dust(mask, dust)
+    return mask.astype(np.uint8)
+
+
 def baseline_hysteresis(prob, t_low=0.50, t_high=0.90, dust=100):
     """Standard hysteresis + closing + dust (matches eval_transunet defaults)."""
     mask = hysteresis(prob, t_low, t_high)
@@ -331,6 +357,93 @@ def build_configs(dry_run=False):
     return configs
 
 
+def build_tlow_configs(dry_run=False):
+    """Build T_low sweep configs: baselines + thinning + connectivity at various T_low."""
+    configs = []
+
+    # --- Baselines at many T_low values ---
+    for t_low in [0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70]:
+        configs.append({
+            'name': f'base_tl{t_low:.2f}',
+            'method': 'baseline',
+            'params': {'t_low': t_low, 't_high': 0.90, 'dust': 100},
+        })
+
+    # --- Thinning: low T_low + erosion ---
+    for t_low in [0.30, 0.40, 0.50, 0.60]:
+        for erosion in [1, 2]:
+            configs.append({
+                'name': f'erode_tl{t_low:.2f}_e{erosion}',
+                'method': 'thin_erode',
+                'params': {'t_low': t_low, 't_high': 0.90,
+                           'erosion_iters': erosion, 'dust': 100},
+            })
+
+    # --- Thinning: low T_low + closing + erosion ---
+    for t_low in [0.40, 0.50, 0.60]:
+        for closing_r in [1, 2]:
+            for erosion in [1, 2]:
+                configs.append({
+                    'name': f'close_erode_tl{t_low:.2f}_c{closing_r}_e{erosion}',
+                    'method': 'thin_closing_erode',
+                    'params': {'t_low': t_low, 't_high': 0.90,
+                               'closing_r': closing_r, 'erosion_iters': erosion,
+                               'dust': 100},
+                })
+
+    # --- Connectivity at lower T_low: gap fill ---
+    for t_low_strict in [0.40, 0.50, 0.60]:
+        for gap_prob in [0.20, 0.30]:
+            for iters in [3, 5]:
+                configs.append({
+                    'name': f'A_gap_tl{t_low_strict}_gp{gap_prob}_i{iters}',
+                    'method': 'gap_fill',
+                    'params': {
+                        't_low_strict': t_low_strict, 't_high': 0.90,
+                        'gap_prob_thresh': gap_prob, 'dilation_iters': iters,
+                        'dust': 100,
+                    },
+                })
+
+    # --- Connectivity at lower T_low: dilate-merge-erode ---
+    for t_low in [0.40, 0.50, 0.60]:
+        for dil_r in [1, 2]:
+            configs.append({
+                'name': f'B_dme_tl{t_low}_r{dil_r}',
+                'method': 'dilate_merge_erode',
+                'params': {
+                    't_low': t_low, 't_high': 0.90,
+                    'dilation_r': dil_r, 'erosion_r': dil_r,
+                    'prob_floor': 0.10, 'dust': 100,
+                },
+            })
+
+    # --- Two-pass hysteresis at lower strict thresholds ---
+    for t_low_strict in [0.40, 0.50, 0.60]:
+        for t_low_gap in [0.20, 0.30]:
+            for bridge_dist in [3, 5]:
+                configs.append({
+                    'name': f'C_2pass_tl{t_low_strict}_gap{t_low_gap}_bd{bridge_dist}',
+                    'method': 'two_pass',
+                    'params': {
+                        't_low_strict': t_low_strict, 't_high': 0.90,
+                        't_low_gap': t_low_gap, 'max_bridge_dist': bridge_dist,
+                        'dust': 100,
+                    },
+                })
+
+    if dry_run:
+        dry = [configs[0], configs[2]]  # baseline + one erode
+        for method in ['thin_closing_erode', 'gap_fill', 'dilate_merge_erode', 'two_pass']:
+            for c in configs:
+                if c['method'] == method:
+                    dry.append(c)
+                    break
+        configs = dry
+
+    return configs
+
+
 # ── Dispatch ─────────────────────────────────────────────
 
 def apply_pp(method, prob, params):
@@ -345,6 +458,10 @@ def apply_pp(method, prob, params):
         return two_pass_hysteresis(prob, **params)
     elif method == 'combined':
         return combined_method(prob, **params)
+    elif method == 'thin_erode':
+        return thin_erode(prob, **params)
+    elif method == 'thin_closing_erode':
+        return thin_closing_erode(prob, **params)
     else:
         raise ValueError(f"Unknown method: {method}")
 
@@ -360,6 +477,9 @@ def main():
                         help='Metric downsample (1=full res)')
     parser.add_argument('--dry-run', action='store_true',
                         help='Quick test: 2 volumes, 1 config per method')
+    parser.add_argument('--config-set', type=str, default='connectivity',
+                        choices=['connectivity', 'tlow'],
+                        help='Config set: connectivity (original) or tlow (T_low sweep)')
     args = parser.parse_args()
 
     probmap_dir = Path(args.probmap_dir)
@@ -395,7 +515,10 @@ def main():
     print(f"Loaded {len(data)} volumes")
 
     # Build configs
-    configs = build_configs(dry_run=args.dry_run)
+    if args.config_set == 'tlow':
+        configs = build_tlow_configs(dry_run=args.dry_run)
+    else:
+        configs = build_configs(dry_run=args.dry_run)
     print(f"\nSweeping {len(configs)} configurations...")
     print(f"{'Config':<40} {'Comp':>6} {'Topo':>6} {'SDice':>6} {'VOI':>6} "
           f"{'FG%':>5} {'#CC':>5} {'Time':>5}")

@@ -3,13 +3,14 @@
 # Key differences from run_pseudo_stage3_4.sh:
 #   - RUN_NAME=pseudo_frozen_cldice
 #   - --cldice-weight 0.5 (was 0.0)
-#   - --cldice-iters 3 (reduced from default 10 to fit in 48GB)
+#   - --cldice-iters 5 (reduced from default 10 to fit in 48GB)
 #   - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True (prevent fragmentation OOM)
 #   - LOG=logs/pseudo_cldice_gpu2.log
 set -uo pipefail
 cd /workspace/vesuvius-kaggle-competition
 export CUDA_VISIBLE_DEVICES=0
 export PYTHONUNBUFFERED=1
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 VENV=/workspace/venv/bin/python3
@@ -25,7 +26,7 @@ echo "Start: $(date)" | tee -a "$LOG"
 
 # ── Stage 3: Training with pseudo-labels + clDice ──
 echo "" | tee -a "$LOG"
-echo "=== STAGE 3: Training with Pseudo-Labels + clDice (iters=3) ===" | tee -a "$LOG"
+echo "=== STAGE 3: Training with Pseudo-Labels + clDice (iters=10) ===" | tee -a "$LOG"
 echo "Start: $(date)" | tee -a "$LOG"
 
 $VENV scripts/train_transunet.py \
@@ -42,7 +43,7 @@ $VENV scripts/train_transunet.py \
     --dist-power 2.0 \
     --boundary-weight 0.3 \
     --cldice-weight 0.5 \
-    --cldice-iters 3 \
+    --cldice-iters 5 \
     2>&1 | tee -a "$LOG"
 
 TRAIN_EXIT=$?

@@ -229,7 +229,7 @@ def collate_fn(batch):
 
 # ── Loss function (Keras) ────────────────────────────────
 def build_loss(num_classes=3, w_srec=0.75, w_fp=0.50, w_dist=0.0, dist_power=1.0,
-               dist_margin=0.0, w_boundary=0.0, w_cldice=0.0):
+               dist_margin=0.0, w_boundary=0.0, w_cldice=0.0, cldice_iters=10):
     """Build the SkeletonRecallPlusDiceLoss using Keras ops.
 
     Args:
@@ -266,7 +266,7 @@ def build_loss(num_classes=3, w_srec=0.75, w_fp=0.50, w_dist=0.0, dist_power=1.0
             num_classes=num_classes,
             target_class_ids=1,
             ignore_class_ids=2,
-            iters=10,
+            iters=cldice_iters,
             memory_efficient_skeleton=True,
         )
 
@@ -367,10 +367,17 @@ def main():
                         help='Boundary loss weight (0=disabled). Penalizes distance from GT surface boundary.')
     parser.add_argument('--cldice-weight', type=float, default=0.0,
                         help='Centerline Dice loss weight (0=disabled). Rewards skeleton overlap between pred and GT.')
+    parser.add_argument('--cldice-iters', type=int, default=10,
+                        help='Soft-skeletonization iterations for clDice (default 10). Lower=less memory.')
     parser.add_argument('--label-dir', type=str, default=None,
                         help='Custom label directory (default: data/train_labels/). Use for pseudo-labels.')
     parser.add_argument('--freeze-encoder', action='store_true',
                         help='Freeze CNN encoder (SEResNeXt50), only train decoder + head')
+    parser.add_argument('--unfreeze', type=str, nargs='+', default=None,
+                        help='Selective unfreezing: freeze everything, then unfreeze named components. '
+                             'Options: vit, decoder, queries, head, cnn. '
+                             'E.g. --unfreeze vit = freeze all except ViT. '
+                             'Overrides --freeze-encoder if both specified.')
     parser.add_argument('--discriminative-lr', action='store_true',
                         help='Use per-layer-group LRs: encoder=lr/100, decoder=lr/10, head=lr')
     args = parser.parse_args()
@@ -438,8 +445,45 @@ def main():
     model.load_weights(str(args.weights))
     print(f"Model params: {model.count_params() / 1e6:.1f}M")
 
-    # ── Freeze encoder if requested ──
-    if args.freeze_encoder:
+    # ── Freeze / selective unfreeze ──
+    if args.unfreeze:
+        # Freeze everything first, then selectively unfreeze named components
+        for layer in model.layers:
+            layer.trainable = False
+
+        # Component name → layer name prefix mapping
+        component_prefixes = {
+            'cnn': ('conv1', 'pool1', 'stack'),
+            'vit': ('transunet_vit',),
+            'decoder': ('transunet_masked', 'transunet_mlp', 'cnn_feature',
+                        'learnable_queries', 'class_prediction'),
+            'queries': ('learnable_queries',),
+            'head': ('unet_decoder', 'final_conv', 'segmentation'),
+        }
+
+        unfreeze_prefixes = []
+        for comp in args.unfreeze:
+            if comp not in component_prefixes:
+                print(f"WARNING: Unknown component '{comp}'. "
+                      f"Valid: {list(component_prefixes.keys())}")
+                continue
+            unfreeze_prefixes.extend(component_prefixes[comp])
+        unfreeze_prefixes = tuple(unfreeze_prefixes)
+
+        n_unfrozen = 0
+        for layer in model.layers:
+            if layer.name.startswith(unfreeze_prefixes):
+                layer.trainable = True
+                n_unfrozen += 1
+
+        trainable_params = sum(
+            np.prod(v.shape) for v in model.trainable_weights
+        )
+        print(f"Selective unfreeze [{', '.join(args.unfreeze)}]: "
+              f"{n_unfrozen} layers unfrozen, "
+              f"{trainable_params / 1e6:.1f}M trainable params")
+
+    elif args.freeze_encoder:
         n_frozen = 0
         for layer in model.layers:
             name = layer.name
@@ -461,7 +505,8 @@ def main():
                          w_dist=args.dist_weight, dist_power=args.dist_power,
                          dist_margin=args.dist_margin,
                          w_boundary=args.boundary_weight,
-                         w_cldice=args.cldice_weight)
+                         w_cldice=args.cldice_weight,
+                         cldice_iters=args.cldice_iters)
 
     if use_torch_optim:
         # Discriminative LR: use PyTorch optimizer with parameter groups.
@@ -543,6 +588,8 @@ def main():
     print(f"  Total steps: {total_steps}")
     print(f"  Loss weights: skel={args.skel_weight}, fp={args.fp_weight}, dist={args.dist_weight}, dist_power={args.dist_power}, dist_margin={args.dist_margin}, boundary={args.boundary_weight}, cldice={args.cldice_weight}")
     print(f"  Freeze encoder: {args.freeze_encoder}")
+    if args.unfreeze:
+        print(f"  Selective unfreeze: {args.unfreeze}")
     print(f"  Checkpoint dir: {ckpt_dir}")
 
     # ── Training loop ──
@@ -557,8 +604,8 @@ def main():
         t_epoch = time.time()
         train_losses = []
 
-        # Training (don't reset trainable if encoder is frozen)
-        if not args.freeze_encoder:
+        # Training (don't reset trainable if encoder is frozen or selectively unfrozen)
+        if not args.freeze_encoder and not args.unfreeze:
             model.trainable = True
         if use_torch_optim:
             torch_optimizer.zero_grad()

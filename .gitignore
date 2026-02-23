@@ -1,27 +1,47 @@
-# Data (too large for git)
-train_images/
-train_labels/
-test_images/
+# Data — images, labels, and generated artifacts (too large for git)
+data/train_images/
+data/test_images/
+data/train_labels/
+data/deprecated_train_images/
+data/deprecated_train_labels/
+data/*_probmaps/
+data/pseudo_labels/
 vesuvius-challenge-surface-detection.zip
+
+# Top-level symlinks into data/ (break on clone without data)
+/train_images
+/train_labels
+/test_images
+/train.csv
+/test.csv
 
 # Model weights
 checkpoints/
 pretrained_weights/
+
+# Kaggle artifacts
 kaggle/kaggle_weights/
+kaggle/kaggle_weights_download/
+kaggle/kaggle_output/
 kaggle/kaggle_notebook/*.bak
 kaggle/submission/
 kaggle/submission.zip
 
+# Submissions (binary TIFFs)
+submission/
+submission.zip
+
 # Python venv
 vesuvius/
 
-# Deprecated data
+# Deprecated data (top-level, old layout)
 deprecated_train_images/
 deprecated_train_labels/
 
 # Third-party libs (installed from Kaggle datasets, not ours)
 libs/topological-metrics-kaggle/
 libs/wheels/
+libs/topometrics_download/
 libs/killer-ant/process_helper.py
 
 # Downloaded research notebooks (large, from Kaggle)
@@ -29,6 +49,12 @@ research/notebooks/
 
 # Logs
 logs/
+
+# Stray log files
+vesuvius-surface-detection-inference.log
+
+# Claude Code local settings
+.claude/settings.local.json
 
 # Jupyter
 .ipynb_checkpoints/
