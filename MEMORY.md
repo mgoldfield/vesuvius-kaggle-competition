@@ -85,30 +85,41 @@ alignment). The fix is two-pronged:
 The user prioritizes understanding the problem deeply over running many experiments.
 They'd rather run 3 well-motivated experiments than 10 random ones.
 
-## Current State (Feb 23, ~00:15 AM EST)
+## Current State (Feb 24, ~1:30 AM EST)
 
 **Best model:** swa_70pre_30margin_dist_ep5 (comp=0.5551). SWA blending is the winning
 strategy — no single fine-tuned model beats pretrained, but 70/30 blends consistently do.
+Multi-model SWA (3-5 models) gives diminishing returns — best SDice (0.8314) but doesn't
+beat single-blend comp (0.5551 vs 0.5549).
 
-**Key innovation this session:** Selective component unfreezing — `--unfreeze` flag added
-to train_transunet.py. Can now train just the ViT (connectivity) or just the decoder
-(boundary precision) with targeted loss functions. User proposed this approach and also
-the insight that balanced losses (keeping skel+fp defaults while heavily weighting the
-new targeted loss) are better than pure isolation.
+**Key findings this session:**
+- Multi-model SWA is a dead end for comp improvement
+- ViT balanced unfreezing peaked at val_loss=1.4268, resume from ep8 showed no further gain
+- Decoder unfreezing consistently worse than ViT (val_loss ~1.65 vs ~1.43)
+- gpu1 high-LR (10x) diverging — loss worse than standard runs
+- Pseudo-label ep15 blend (0.5548) nearly ties best but doesn't beat it
 
-**Active experiments (5 GPUs):**
-- gpu0: Eval chain for gpu2 checkpoints (ep10=0.5543, ep15=0.5559) + T_low sweeps (20 vol)
-- gpu1: pseudo_margin2_cldice training ep 5/25
-- gpu2: Round-2 iterative pseudo-labeling (probmaps 205/704)
-- gpu3: Setting up — ViT unfreeze chain (pure clDice → balanced clDice)
-- gpu4: Setting up — Decoder unfreeze chain (pure margin dist → balanced margin dist)
+**Active experiments (3 remote GPUs, all confirmed training at 1:30AM EST):**
+- gpu1: ViT high-LR resume ep 4/6, step 650/704 (finishing ~2AM EST)
+- gpu3: Combined ViT+decoder unfreeze ep 2/15 (loss 1.4298, ETA ~2PM EST)
+- gpu4: ViT dist-focus ep 2/15 (loss 1.7764 — concerning, ETA ~2PM EST)
+- gpu0: Running Multi C eval (13/24 vols), then more SWA blend evals queued
 
-**Strategic priorities (agreed with user):**
-1. Confirm close_erode PP with 20-vol T_low sweep → re-evaluate models
-2. Pick best model from eval results + SWA blends → submit
-3. Selective component unfreezing experiments (gpu3/gpu4)
-4. Iterative pseudo-labeling (round 2, gpu2)
-5. Train on all 786 volumes for final submission
+**gpu2 ABANDONED** — disk full, cannot recover.
 
-**GPU fleet:** gpu0 (RTX 5090) + gpu1-4 (RTX 6000 Ada ×4). All active.
-SSH key for remotes: `~/.ssh/remote-gpu`. See NOTES.md hardware table for details.
+**Network notes:** Remote GPUs were spotty earlier tonight — ports changed after restarts.
+All 3 confirmed training under tmux at 1:30AM. Network seems stable now.
+
+**Remaining eval queue:** ViT balanced ep9, ViT high-LR ep1, decoder balanced ep5/ep10,
+plus new checkpoints from gpu1/3/4 as they arrive.
+
+**Strategic priorities:**
+1. Continue eval chain on gpu0 — still have 4+ SWA blends to evaluate
+2. Pull gpu1 checkpoints when it finishes (should be very soon)
+3. Pull gpu3/gpu4 ep5 checkpoints when they reach ep5 (~hours from now)
+4. Create SWA blends from new checkpoints → eval
+5. Pick best model → submit to Kaggle
+6. Train on all 786 volumes for final submission (deadline Feb 27)
+
+**GPU fleet:** gpu0 (RTX 5090, local) + gpu1/3/4 (RTX 6000 Ada, remote, currently unreachable).
+gpu2 abandoned. SSH key: `~/.ssh/remote-gpu`. See NOTES.md hardware table for ports.

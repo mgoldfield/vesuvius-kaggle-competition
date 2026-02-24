@@ -7,7 +7,7 @@ for active decision-making — keep this file lean.
 ## Competition
 - **Goal:** Detect papyrus surfaces in 3D CT scans of Herculaneum scrolls
 - **Metric:** `0.30*TopoScore + 0.35*SurfaceDice@tau=2 + 0.35*VOI_score`
-- **Deadline:** Feb 27, 2026 (4 days remaining)
+- **Deadline:** Feb 27, 2026 (3 days remaining)
 - **Submission:** Code competition — Kaggle notebook, GPU, ≤9hr, no internet
 - **Leaderboard:** 1,334 teams. Top score 0.607. Our best public: 0.504 (v20, TransUNet)
 - **Public test: only 1 volume** (ID 1407735). Scores are high-variance/unreliable.
@@ -22,10 +22,11 @@ for active decision-making — keep this file lean.
 | Name | GPU | SSH | Role |
 |---|---|---|---|
 | **gpu0** (this machine) | RTX 5090 32GB | local | Primary control. Probmap generation + PP sweep. |
-| **gpu1** (new) | RTX 6000 Ada 48GB | `ssh -i ~/.ssh/remote-gpu root@195.26.233.34 -p 39422` | Pseudo-label training WITHOUT clDice (control). |
-| **gpu2** | RTX 6000 Ada 48GB | `ssh -i ~/.ssh/remote-gpu root@195.26.233.87 -p 25763` | Round-2 pseudo-labeling pipeline. |
-| **gpu3** (new) | RTX 6000 Ada 48GB | `ssh -i ~/.ssh/remote-gpu root@195.26.233.74 -p 32327` | Selective unfreeze: ViT + clDice. |
-| **gpu4** (new) | RTX 6000 Ada 48GB | `ssh -i ~/.ssh/remote-gpu root@195.26.233.43 -p 52276` | Selective unfreeze: decoder + margin dist. |
+| **gpu1** (new) | RTX 6000 Ada 48GB | `ssh -i ~/.ssh/remote-gpu root@195.26.233.34 -p 39479` | ViT high-LR unfreeze (9/15 ep done, idle after restart). |
+| **gpu2** | RTX 6000 Ada 48GB | `ssh -i ~/.ssh/remote-gpu root@195.26.233.87 -p 25763` | Round-2 pseudo-labeling pipeline. Restarted Feb 23. |
+| **gpu3** (new) | RTX 6000 Ada 48GB | `ssh -i ~/.ssh/remote-gpu root@195.26.233.74 -p 32327` | ViT balanced done (7/7 ep). IDLE. |
+| **gpu4** (new) | RTX 6000 Ada 48GB | `ssh -i ~/.ssh/remote-gpu root@195.26.233.43 -p 53200` | Decoder balanced exp 2. Restarted Feb 23. |
+| **data-gpu** (new) | ? | `ssh -i ~/.ssh/remote-gpu root@195.26.233.98 -p 31182` | External data download + pseudo-labeling. |
 
 - Old gpu1 (RTX 5090): **decommissioned** Feb 22. All data synced to gpu0.
 - Venv: `/workspace/venv/`, bootstrap: `bash /workspace/start.sh`
@@ -169,7 +170,36 @@ T_low sweeps running overnight on 20 volumes. If confirmed:
 - Kaggle notebook hardening, timing, error handling
 - Final submissions with buffer for Kaggle queue
 
-## Current Status (Feb 23, ~12:30 PM EST / 17:30 UTC)
+## Current Status (Feb 24, ~1:30 AM EST / 05:30 UTC)
+
+### GPU Fleet Status
+
+| GPU | Status | Task | Progress | ETA |
+|-----|--------|------|----------|-----|
+| gpu0 | Eval | Multi C eval (pseudo pair 60/20/20) | Vol 13/24 | ~7 min |
+| gpu1 | Training | `unfreeze_vit_highLR_resume` (from ep9) | Ep 4/6, step 650/704 | ~Feb 24 2AM EST |
+| gpu2 | **ABANDONED** | Disk full, cannot SSH | — | — |
+| gpu3 | Training | `unfreeze_vit_decoder_balanced` (combined ViT+decoder) | Ep 2/15, loss=1.4298 | ~Feb 24 2PM EST |
+| gpu4 | Training | `unfreeze_vit_dist_focus` (dist=1.0, cldice=0.3) | Ep 2/15, loss=1.7764 | ~Feb 24 2PM EST |
+| data-gpu | Running | External data pseudo-labeling | Other Claude | — |
+
+**NOTE:** Network to remote GPUs was spotty tonight (Feb 24). Confirmed all 3 are training
+at 1:30 AM EST. All runs under tmux — survive SSH drops.
+
+### Multi-model SWA blend results — COMPLETE
+
+| Blend | Pretrained | Fine-tuned models | Comp | SDice | Notes |
+|-------|-----------|-------------------|------|-------|-------|
+| **Best single** | 70% | 30% margin_dist_ep5 | **0.5551** | 0.8306 | Current best |
+| Best single (tie) | 70% | 30% pseudo_margin_dist_ep5 | 0.5551 | 0.8306 | Tied |
+| Multi D | 50% | 25% margin_dist + 25% cldice | 0.5549 | **0.8314** | Best SDice ever |
+| Multi B (5-model) | 50% | 15/15/10/10 spread | 0.5545 | 0.8311 | |
+| Multi A | 60% | 20% margin_dist + 20% cldice | 0.5543 | 0.8311 | |
+| Multi C (pseudo pair) | 60% | 20% pseudo_margin + 20% pseudo_cldice | RUNNING (13/24) | — | |
+
+**Conclusion:** Multi-model SWA doesn't beat best single blend on comp (0.5549 vs 0.5551).
+Pushes SDice to 0.8314 (best ever) but differences are within noise. Diminishing returns
+from adding more models. Best comp remains swa_70pre_30margin_dist_ep5.
 
 ### gpu2 pseudo_frozen_margin_dist — EVAL COMPLETE
 
@@ -180,75 +210,83 @@ T_low sweeps running overnight on 20 volumes. If confirmed:
 | **ep15** | **0.5559** | **0.8308** | Best standalone |
 | ep20 | 0.5550 | 0.8304 | |
 | ep25 | 0.5552 | 0.8307 | |
-| SWA 70/30 ep15 | 0.5542 | — | Below current best (0.5551) |
-| SWA 70/30 ep5 | EVAL QUEUED | — | Created, needs eval |
+| SWA 70/30 ep15 | 0.5542 | — | Below current best |
+| SWA 70/30 ep5 | 0.5551 | 0.8306 | Ties best, better SDice |
 
-### T_low PP sweeps — NEARLY DONE (51/59 configs)
+### T_low PP sweeps — ESSENTIALLY DONE (51/59)
 
-Both 20-vol sweeps are at 51/59 configs. Results are conclusive — remaining 8 are C_2pass
-variants (all 0.49-0.52, clearly worse). Best PP configs confirmed:
+Both 20-vol sweeps at 51/59 configs. Results conclusive:
 
 | Probmaps | Best Config | Comp | vs base_tl0.70 |
 |----------|-------------|------|----------------|
 | SWA val | close_erode_tl0.40_c2_e1 | 0.5368 | +0.0018 |
 | Margin dist blend | erode_tl0.40_e1 | 0.5370 | +0.0014 |
 
-**Conclusion:** erode_tl0.40_e1 is the best PP config. Improvement is real but small (+0.001-0.002).
-Close_erode and plain erode are nearly identical. The 2-vol dry-run (0.5595) was misleadingly
-optimistic — on 20 vols the improvement shrinks substantially.
+**Conclusion:** erode_tl0.40_e1 best PP (+0.001-0.002 comp). 2-vol dry-run was misleading.
 
 ### Kaggle: All submissions score 0.504
 
-v22 (SWA best) and v24 (margin_dist blend + close_erode PP) both scored 0.504. Public LB
-is unreliable (1 test volume). We should keep submitting our best local val models.
+Public LB unreliable (1 test volume). Keep submitting best local val models.
 
-#### 2. gpu3 — RESTARTED (new SSH port: 32327)
+### gpu3 — Combined ViT+decoder unfreeze (NEW)
 
 **SSH:** `ssh -o StrictHostKeyChecking=no -i ~/.ssh/remote-gpu root@195.26.233.74 -p 32327`
 
-**Experiments that were running:**
+Completed: Exp 1 (ViT pure clDice, 15 ep), Exp 2 (ViT balanced, 15 ep total). All checkpoints on gpu0.
+- Exp 2 resume (7 ep from ep8): best val_loss=1.4268 (ep1/7 only improvement, then plateaued)
+- **NEW:** Combined ViT+decoder unfreeze with balanced losses. 15 epochs, LR=1e-5. Launching now.
 
-**Exp 1:** `launch_gpu3_unfreeze_vit.sh` — ViT-only, pure clDice
-- Unfreeze: vit (~25M params) | LR: 1e-5 | 15 epochs
-- Loss: cldice=1.0, cldice-iters=5 | All others=0
-- Log: `logs/unfreeze_vit_cldice.log`
-- Checkpoints: `checkpoints/transunet_unfreeze_vit_cldice/`
+### gpu4 — ViT dist-focus unfreeze (NEW)
 
-**Exp 2:** `launch_gpu3_unfreeze_vit_balanced.sh` — ViT-only, clDice-heavy balanced
-- Unfreeze: vit (~25M params) | LR: 1e-5 | 15 epochs
-- Loss: cldice=1.5, skel=0.75, fp=0.50, boundary=0.3
-- Log: `logs/unfreeze_vit_balanced.log`
-- Checkpoints: `checkpoints/transunet_unfreeze_vit_balanced/`
+**SSH:** `ssh -o StrictHostKeyChecking=no -i ~/.ssh/remote-gpu root@195.26.233.43 -p 53200`
 
-**If chain fails or only Exp 1 ran:**
-```bash
-# SSH in, check what happened
-ssh -i ~/.ssh/remote-gpu root@195.26.233.74 -p 54496
-tmux list-sessions
-cat logs/unfreeze_vit_cldice.log | tail -20
-cat logs/unfreeze_vit_balanced.log | tail -20
-# Re-launch exp 2 if needed
-tmux new-session -d -s train 'cd /workspace/vesuvius-kaggle-competition && bash launch_gpu3_unfreeze_vit_balanced.sh'
-```
+Completed: Exp 1 (Decoder margin dist, 15 ep), Exp 2 (Decoder balanced, 15 ep). All checkpoints on gpu0.
+- Decoder balanced: val_loss 1.7628→1.6512 over 15 ep (still converging but high vs ViT ~1.43)
+- **NEW:** ViT unfreeze with dist-focus (dist=1.0, cldice=0.3, margin=2). Tests if ViT benefits
+  more from distance-based thinning vs connectivity. 15 epochs, LR=1e-5. Launching now.
 
-#### 3. gpu4 — Chained selective unfreeze decoder experiments
+### gpu1 — ViT high-LR resume (FINISHING SOON)
 
-**SSH:** `ssh -o StrictHostKeyChecking=no -i ~/.ssh/remote-gpu root@195.26.233.43 -p 52276`
-**Tmux:** `train` session
+**SSH:** `ssh -o StrictHostKeyChecking=no -i ~/.ssh/remote-gpu root@195.26.233.34 -p 39479`
 
-**Chain script:** `/workspace/vesuvius-kaggle-competition/launch_gpu4_chain.sh` runs two experiments back-to-back:
+Original run: 9/15 epochs done before host outage. val_loss: 1.4406 (ep1 best) → 1.4520 (ep9, diverging).
+High LR (1e-4 = 10x) seems too aggressive — loss worse than standard 1e-5 runs.
+Resumed from ep9 for 6 more epochs. Last seen at ep 4/6, loss ~1.4540. Should finish ~2AM EST.
+All pseudo_margin2_cldice checkpoints (ep5-25) safely on gpu0.
+**TODO:** Pull resume checkpoints when done, create SWA blends, eval.
 
-**Exp 1:** `launch_gpu4_unfreeze_decoder.sh` — Decoder+head, pure margin dist
-- Unfreeze: decoder head (~6M params) | LR: 5e-5 | 15 epochs
-- Loss: dist=1.0(margin=1), boundary=0.3 | All others=0
-- Log: `logs/unfreeze_decoder_margin1.log`
-- Checkpoints: `checkpoints/transunet_unfreeze_decoder_margin1/`
+### data-gpu — External data pseudo-labeling (NEW)
 
-**Exp 2:** `launch_gpu4_unfreeze_decoder_balanced.sh` — Decoder+head, margin-dist-heavy balanced
-- Unfreeze: decoder head (~6M params) | LR: 5e-5 | 15 epochs
-- Loss: dist=1.5(margin=1), skel=0.75, fp=0.50, boundary=0.3, cldice=0.3
-- Log: `logs/unfreeze_decoder_balanced.log`
-- Checkpoints: `checkpoints/transunet_unfreeze_decoder_balanced/`
+**SSH:** `ssh -o StrictHostKeyChecking=no -i ~/.ssh/remote-gpu root@195.26.233.98 -p 31182`
+RTX 6000 Ada 48GB. Codebase, model weights, pretrained weights all synced.
+Task doc: `EXTERNAL_DATA_TASK.md`. Needs venv setup (INSTALLATION.md has instructions).
+Other Claude instance starting on this GPU.
+
+### Eval queue on gpu0
+
+Currently running: Multi C (pseudo pair 60/20/20), 13/24 vols. Queue after:
+1. ViT balanced ep9 — `swa_70pre_30unfreeze_vit_balanced_ep9.weights.h5`
+2. ViT high-LR ep1 — `swa_70pre_30unfreeze_vit_highLR_ep1.weights.h5`
+3. Decoder balanced ep5 — `swa_70pre_30unfreeze_decoder_balanced_ep5.weights.h5`
+4. Decoder balanced ep10 — `swa_70pre_30unfreeze_decoder_balanced_ep10.weights.h5`
+5. New checkpoints from gpu1/3/4 as they come in (gpu1 finishing soon)
+
+**Completed evals this session (in order):**
+- pseudo_margin2_cldice ep10: comp=0.5545
+- pseudo_margin2_cldice ep15: comp=0.5548
+- Multi D (50/25/25): comp=0.5549, SDice=0.8314
+- Multi B (5-model): comp=0.5545
+- Multi C (pseudo pair): RUNNING
+
+### Additional evals completed this session
+
+| Model | Comp | SDice | Notes |
+|-------|------|-------|-------|
+| swa_70pre_30pseudo_margin2_cldice_ep10 | 0.5545 | 0.8304 | Marginal vs ep5 (0.5547) |
+| swa_70pre_30pseudo_margin2_cldice_ep15 | 0.5548 | 0.8308 | Best pseudo-label SWA blend |
+| multi 50/25/25 (D) | 0.5549 | **0.8314** | Best SDice ever |
+| multi 5-model (B) | 0.5545 | 0.8311 | Diminishing returns |
+| multi C (pseudo pair) | RUNNING | — | 13/24 vols |
 
 **If chain fails or only Exp 1 ran:**
 ```bash
@@ -302,15 +340,45 @@ Added to `scripts/train_transunet.py`:
   Dir: `data/swa_70pre_30margin_dist_ep5_probmaps/`
 - **Kaggle v24 submitted** — new best model + close_erode PP (T_low=0.40). Running on Kaggle.
 
-### clDice pseudo-label eval results
+### All SWA blend evaluation results (Feb 23)
 
-| Model | Comp | Topo | SDice | VOI | n |
-|-------|------|------|-------|-----|---|
-| **pseudo_frozen_cldice_ep20** | **0.5546** | 0.2476 | **0.8304** | 0.5419 | 24 |
-| pseudo_frozen_cldice_ep25 | 0.5545 | 0.2472 | 0.8300 | 0.5425 | 24 |
-| pseudo_frozen_cldice_ep10 | 0.5538 | 0.2459 | 0.8295 | 0.5419 | 24 |
-| pseudo_frozen_cldice_ep15 | 0.5538 | 0.2451 | 0.8296 | 0.5427 | 24 |
-| *swa_70pre_30topo_ep5 (previous best)* | *0.5549* | *0.2499* | *0.8291* | *0.5420* | *24* |
+| Model | Comp | SDice | Notes |
+|-------|------|-------|-------|
+| **swa_70pre_30margin_dist_ep5** | **0.5551** | 0.8299 | **CURRENT BEST** (original labels) |
+| swa_70pre_30pseudo_margin_dist_ep5 | 0.5551 | 0.8306 | Ties best (pseudo-labels), better SDice |
+| swa_70pre_30topo_ep5 | 0.5549 | 0.8291 | Previous best (frozen_boundary) |
+| pseudo_margin2_cldice_ep5 (standalone) | 0.5547 | 0.8300 | gpu1, not SWA blended |
+| pseudo_frozen_cldice_ep20 (standalone) | 0.5546 | 0.8304 | Best SDice standalone |
+| swa_70pre_30cldice_ep20 | 0.5543 | 0.8308 | |
+| swa_70pre_30pseudo_margin_dist_ep15 | 0.5542 | — | |
+| swa_70pre_30unfreeze_vit_cldice_ep5 | 0.5534 | 0.8277 | ViT unfreeze (gpu3) |
+| swa_70pre_30unfreeze_vit_balanced_ep5 | 0.5534 | 0.8277 | ViT unfreeze balanced (gpu3) |
+| swa_70pre_30unfreeze_decoder_margin1_ep5 | 0.5498 | 0.8126 | Decoder unfreeze (gpu4) — degraded |
+| swa_70pre_30pseudo_margin2_cldice_ep10 | 0.5545 | 0.8304 | gpu1 pseudo labels, ep10 |
+| swa_70pre_30pseudo_margin2_cldice_ep15 | 0.5548 | 0.8308 | gpu1 pseudo labels, ep15 |
+| multi 50/25/25 (margin+cldice) | 0.5549 | **0.8314** | Best SDice ever |
+| multi 5-model (50/15/15/10/10) | 0.5545 | 0.8311 | |
+| multi 60/20/20 (margin+cldice) | 0.5543 | 0.8311 | |
+
+**Key insight:** SWA 70/30 blends consistently land at 0.553-0.555 regardless of fine-tuned model.
+Pretrained weights dominate. Multi-model SWA pushes SDice but doesn't improve comp.
+
+### Selective unfreezing results summary
+
+| Experiment | Component | Loss | Comp (SWA 70/30) | Status |
+|------------|-----------|------|-------------------|--------|
+| gpu3 exp 1 | ViT | pure clDice | 0.5534 | Done (15 ep) |
+| gpu3 exp 2 | ViT | balanced clDice | 0.5534 | Done (15 ep, resumed) |
+| gpu4 exp 1 | Decoder+head | margin dist | 0.5498 | Done (15 ep) |
+| gpu4 exp 2 | Decoder+head | balanced | pending eval | Done (15 ep) |
+| gpu1 highLR | ViT | balanced, LR=1e-4 | pending eval | 9/15 ep done, resuming 6 more (ep 4/6) |
+| **gpu3 NEW** | **ViT+Decoder** | balanced clDice | — | **Training ep 2/15, loss=1.4298** |
+| **gpu4 NEW** | **ViT** | **dist focus** (dist=1.0) | — | **Training ep 2/15, loss=1.7764** |
+
+ViT unfreezing underperformed with 70/30 blend but may benefit from:
+- Higher fine-tune ratio (50/50, 60/40)
+- Higher LR (gpu1 testing 1e-4 vs gpu3's 1e-5)
+- Later epoch selection (ep10/15 instead of ep5)
 
 **Key finding:** clDice ep20 nearly matches our best SWA blend (0.5546 vs 0.5549) and has
 **better SDice** (0.8304 vs 0.8291). Strong SWA blend candidate.
