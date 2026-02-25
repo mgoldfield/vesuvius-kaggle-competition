@@ -164,24 +164,32 @@ Once complete, train on the expanded dataset (competition + external pseudo-labe
 - ~~Multi-model SWA~~ — DEAD END for comp. Pushes SDice but doesn't beat single 70/30 blend.
 - ~~Iterative pseudo-labeling (round 2 on gpu2)~~ — gpu2 abandoned (disk full).
 
-## Current Status (Feb 25, ~12:35 AM EST / 05:35 UTC)
+## Current Status (Feb 25, ~11:40 AM EST / 16:40 UTC)
 
-### FINAL PUSH PLAN (Feb 25-27, deadline Feb 27)
+### FINAL PUSH — SUBMISSIONS RUNNING
 
 Best local comp: **0.5551** (swa_70pre_30margin_dist_ep5, 24-vol cross-scroll).
-External data training produced ep10 at 0.5539 standalone cross-scroll (close but not better yet — needs SWA blend).
+Public LB: 0.504 (all submissions score the same — only 1 public test volume).
 
-| Step | Task | Duration | Status |
-|------|------|----------|--------|
-| 1 | SWA blend external ep4+ep10, eval cross-scroll | 30 min | **RUNNING** (ep10 eval in progress) |
-| 2 | Add `--train-all` flag to training script | 10 min | **DONE** |
-| 3 | Build ensemble inference in Kaggle notebook | 1 hour | **DONE** |
-| 4 | Train on all 786 volumes (no val holdout) | 5 hours | PENDING (waiting for user approval) |
-| 5 | Upload weights + submit to Kaggle | 2-3 hours | PENDING (blocked on #1,4) |
+**Train-all completed:** 15/15 epochs on all 786 volumes, 6.1 hours. Loss: 0.9637→0.9630.
+Checkpoints: ep5, ep10, ep15 at `checkpoints/transunet_all_data_frozen/`.
+Cannot validate locally (trained on all data including val holdout).
 
-**Code changes completed:**
-- `scripts/train_transunet.py`: Added `--train-all` flag — skips val split, trains on all 786 volumes, skips val eval + best model tracking
-- `kaggle/kaggle_notebook/vesuvius-inference.py`: Multi-model ensemble support — `ENSEMBLE_WEIGHTS` list in CFG, loads N models, averages logits across all models × TTA views before thresholding. Adaptive TTA timer auto-adjusts for ensemble overhead.
+**SWA blend created:** 70% pretrained + 30% train-all ep5 → `swa_70pre_30all_data_ep5.weights.h5`
+
+| Submission | Version | Config | Status |
+|------------|---------|--------|--------|
+| **v25** (ensemble) | Kaggle v25 | 2-model: margin_dist + all_data blends, averaged logits | **RUNNING** |
+| **v26** (safety net) | Kaggle v26 | Single model: margin_dist only (validated best 0.5551) | **RUNNING** |
+
+**Kaggle weights dataset:** Cleaned up to 543MB (2 SWA blends + wheels only). Old SegResNet and base pretrained weights removed.
+
+**Kaggle API auth:** Old key expired. New token format: `export KAGGLE_API_TOKEN=KGAT_...` (env var, not kaggle.json).
+
+### What's left
+- Wait for v25 + v26 scores (few hours each)
+- If time allows, can try additional variants (different blend ratios, ep10/ep15 blends)
+- Deadline: Feb 27
 
 ### External data training results
 

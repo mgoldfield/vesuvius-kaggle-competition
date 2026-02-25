@@ -60,8 +60,7 @@ CFG = dict(
     # Each model is ~269MB. 2 models = ~538MB weights + inference overhead.
     ENSEMBLE_WEIGHTS=[
         "/kaggle/input/vesuvius-unet3d-weights/swa_70pre_30margin_dist_ep5.weights.h5",
-        # Add second model for ensemble (uncomment when ready):
-        # "/kaggle/input/vesuvius-unet3d-weights/swa_70pre_30external_data_ep10.weights.h5",
+        "/kaggle/input/vesuvius-unet3d-weights/swa_70pre_30all_data_ep5.weights.h5",
     ],
 
     # SWI overlaps: dual-stream (Tony Li's 0.552 approach)
