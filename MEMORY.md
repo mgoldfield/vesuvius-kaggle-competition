@@ -73,6 +73,13 @@ better than my initial approach of post-processing-only thinning.
   loss components and heavily weight the new one, rather than zeroing everything
   else. This often yields better results since the model retains stability.
 - **Give ETAs in EST, not UTC.** User is on US East Coast.
+- **Selective unfreezing with aggressive losses is a dead end.** Multiple experiments
+  (ViT unfreeze, decoder unfreeze, high-LR, dist-focus) all underperformed the
+  simple frozen-encoder + SWA 70/30 blend. The pretrained encoder is very hard to
+  improve with these loss functions. Don't revisit this direction.
+- **Know when to cut losses on experiments.** User has good instincts about when
+  an approach has been sufficiently explored. Don't keep proposing variations on
+  a theme that's been shown not to work.
 
 ## Project Approach
 
@@ -85,7 +92,7 @@ alignment). The fix is two-pronged:
 The user prioritizes understanding the problem deeply over running many experiments.
 They'd rather run 3 well-motivated experiments than 10 random ones.
 
-## Current State (Feb 24, ~1:30 AM EST)
+## Current State (Feb 24, ~1:45 AM EST)
 
 **Best model:** swa_70pre_30margin_dist_ep5 (comp=0.5551). SWA blending is the winning
 strategy — no single fine-tuned model beats pretrained, but 70/30 blends consistently do.
@@ -98,28 +105,22 @@ beat single-blend comp (0.5551 vs 0.5549).
 - Decoder unfreezing consistently worse than ViT (val_loss ~1.65 vs ~1.43)
 - gpu1 high-LR (10x) diverging — loss worse than standard runs
 - Pseudo-label ep15 blend (0.5548) nearly ties best but doesn't beat it
+- T_low PP sweeps confirmed: erode_tl0.40_e1 best PP, but only +0.001-0.002 over baseline
 
-**Active experiments (3 remote GPUs, all confirmed training at 1:30AM EST):**
-- gpu1: ViT high-LR resume ep 4/6, step 650/704 (finishing ~2AM EST)
-- gpu3: Combined ViT+decoder unfreeze ep 2/15 (loss 1.4298, ETA ~2PM EST)
-- gpu4: ViT dist-focus ep 2/15 (loss 1.7764 — concerning, ETA ~2PM EST)
-- gpu0: Running Multi C eval (13/24 vols), then more SWA blend evals queued
+**Active:**
+- gpu3: Combined ViT+decoder unfreeze ep 3/15 (val_loss=1.4366, ETA ~6:40AM). Pull when done.
+- gpu0: Multi C eval finishing, then 4 more SWA blend evals queued (low priority, just draining).
+- data-gpu: External data processing pipeline — downloading scroll 1 from scrollprize.org.
+  Will generate pseudo-labels for training once complete. **This is our main bet.**
 
-**gpu2 ABANDONED** — disk full, cannot recover.
+**Shut down:** gpu1 (checkpoints pulled ep1-4), gpu4 (checkpoints pulled ep1-2, dead end).
+**Abandoned:** gpu2 (disk full).
 
-**Network notes:** Remote GPUs were spotty earlier tonight — ports changed after restarts.
-All 3 confirmed training under tmux at 1:30AM. Network seems stable now.
+**Strategic priorities (revised):**
+1. **Train on expanded pseudo-labeled data** once data-gpu completes (Feb 24-25) — main bet
+2. Build ensemble at inference (2-3 diverse models, logit averaging) — cheap, orthogonal
+3. Train on all 786 volumes — final submission model (Feb 25-26)
+4. Kaggle hardening + final submissions (Feb 26-27, deadline Feb 27)
 
-**Remaining eval queue:** ViT balanced ep9, ViT high-LR ep1, decoder balanced ep5/ep10,
-plus new checkpoints from gpu1/3/4 as they arrive.
-
-**Strategic priorities:**
-1. Continue eval chain on gpu0 — still have 4+ SWA blends to evaluate
-2. Pull gpu1 checkpoints when it finishes (should be very soon)
-3. Pull gpu3/gpu4 ep5 checkpoints when they reach ep5 (~hours from now)
-4. Create SWA blends from new checkpoints → eval
-5. Pick best model → submit to Kaggle
-6. Train on all 786 volumes for final submission (deadline Feb 27)
-
-**GPU fleet:** gpu0 (RTX 5090, local) + gpu1/3/4 (RTX 6000 Ada, remote, currently unreachable).
-gpu2 abandoned. SSH key: `~/.ssh/remote-gpu`. See NOTES.md hardware table for ports.
+**GPU fleet:** gpu0 (RTX 5090, local) + gpu3 (training overnight) + data-gpu (pipeline running).
+gpu1/gpu4 shut down (disks retained). gpu2 abandoned. SSH key: `~/.ssh/remote-gpu`.

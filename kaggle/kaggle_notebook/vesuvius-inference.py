@@ -56,8 +56,13 @@ print(f"Keras backend: {keras.config.backend()}, version: {keras.version()}")
 
 # ── Configuration ─────────────────────────────────────────
 CFG = dict(
-    # Model weights (SWA 70/30 pretrained/margin_dist blend, local val 0.5551)
-    weights_path="/kaggle/input/vesuvius-unet3d-weights/swa_70pre_30margin_dist_ep5.weights.h5",
+    # Ensemble weights — list of weight file paths. If >1, logits are averaged.
+    # Each model is ~269MB. 2 models = ~538MB weights + inference overhead.
+    ENSEMBLE_WEIGHTS=[
+        "/kaggle/input/vesuvius-unet3d-weights/swa_70pre_30margin_dist_ep5.weights.h5",
+        # Add second model for ensemble (uncomment when ready):
+        # "/kaggle/input/vesuvius-unet3d-weights/swa_70pre_30external_data_ep10.weights.h5",
+    ],
 
     # SWI overlaps: dual-stream (Tony Li's 0.552 approach)
     overlap_public=0.42,   # public stream (argmax labels)
@@ -203,90 +208,111 @@ def iter_tta(volume, level=3):
         inv = (lambda y, axis=axis: np.flip(y, axis=axis))
         yield v, inv
 
-# ── Model + SWI setup ─────────────────────────────────────
-print(f"Loading TransUNet from {CFG['weights_path']}")
-model = TransUNet(
-    input_shape=(160, 160, 160, 1),
-    encoder_name="seresnext50",
-    classifier_activation=None,  # raw logits for binary conversion
-    num_classes=3,
-)
-model.load_weights(CFG["weights_path"])
-print(f"Model params: {model.count_params() / 1e6:.1f}M")
+# ── Model + SWI setup (ensemble-aware) ────────────────────
+ensemble_weights = CFG["ENSEMBLE_WEIGHTS"]
+n_models = len(ensemble_weights)
+print(f"Loading {n_models} model(s) for {'ensemble' if n_models > 1 else 'single-model'} inference")
 
-def build_swi(overlap):
-    return SlidingWindowInference(
-        model,
+models = []
+swi_sets = []  # list of (swi_public, swi_base, swi_hi) per model
+
+for mi, wpath in enumerate(ensemble_weights):
+    print(f"  [{mi+1}/{n_models}] Loading {wpath}")
+    m = TransUNet(
+        input_shape=(160, 160, 160, 1),
+        encoder_name="seresnext50",
+        classifier_activation=None,  # raw logits for binary conversion
         num_classes=3,
-        roi_size=ROI,
-        sw_batch_size=1,
-        mode="gaussian",
-        overlap=float(overlap),
     )
+    m.load_weights(wpath)
+    models.append(m)
 
-swi_public = build_swi(CFG["overlap_public"])  # public stream (argmax)
-swi_base = build_swi(CFG["overlap_base"])      # private stream (TTA augs)
-swi_hi = build_swi(CFG["overlap_hi"])          # private stream (identity)
+    def _build_swi(mdl, overlap):
+        return SlidingWindowInference(
+            mdl,
+            num_classes=3,
+            roi_size=ROI,
+            sw_batch_size=1,
+            mode="gaussian",
+            overlap=float(overlap),
+        )
+
+    swi_sets.append((
+        _build_swi(m, CFG["overlap_public"]),   # public stream (argmax)
+        _build_swi(m, CFG["overlap_base"]),      # private stream (TTA augs)
+        _build_swi(m, CFG["overlap_hi"]),        # private stream (identity)
+    ))
+
+print(f"Model params: {models[0].count_params() / 1e6:.1f}M per model, "
+      f"{n_models} model(s) loaded")
 
 # ── Dual-stream prediction ────────────────────────────────
 def predict_pub_labels_and_private_prob(volume, tta_level=3):
     """
-    Dual-stream inference:
+    Dual-stream inference with ensemble support:
+    - For each model: run TTA, accumulate public logits + private binary logits
+    - Average across all models and TTA views
     - Public stream: average multiclass logits -> argmax labels
     - Private stream: average binary logits -> probability
     tta_level: 3=7-fold, 2=4-fold (rotations), 1=identity only
     """
     mode = CFG["INK_MODE"]
 
-    if not CFG["USE_TTA"] or tta_level <= 0:
-        l_pub = np.asarray(swi_public(volume))
-        pub_labels = l_pub.argmax(-1).astype(np.uint8).squeeze()
-        l_prv = np.asarray(swi_hi(volume))
-        s = binary_logit_from_multiclass_logits(l_prv, mode=mode)
-        prob = sigmoid_stable(s)
-        return pub_labels, prob
+    # Accumulate across ALL models and TTA views
+    logits_sum = None  # public stream: multiclass logits
+    s_sum = None       # private stream: binary logits
+    n_total = 0        # total contributions (models * TTA views)
 
-    logits_sum = None
-    s_sum = None
-    n = 0
+    for mi, (swi_public, swi_base, swi_hi) in enumerate(swi_sets):
+        if not CFG["USE_TTA"] or tta_level <= 0:
+            l_pub = np.asarray(swi_public(volume))
+            logits_sum = l_pub.astype(np.float32) if logits_sum is None else (logits_sum + l_pub.astype(np.float32))
 
-    for t, (v, inv) in enumerate(iter_tta(volume, level=tta_level)):
-        # Public stream
-        l_pub = np.asarray(swi_public(v))
-        l_pub = inv(l_pub)
-        logits_sum = l_pub.astype(np.float32) if logits_sum is None else (logits_sum + l_pub.astype(np.float32))
+            l_prv = np.asarray(swi_hi(volume))
+            s = binary_logit_from_multiclass_logits(l_prv, mode=mode)
+            s_sum = s.astype(np.float32) if s_sum is None else (s_sum + s.astype(np.float32))
+            n_total += 1
+            continue
 
-        # Private stream (high overlap for identity only)
-        if CFG["OV06_MAIN_ONLY"]:
-            swi_use = swi_hi if (t == 0) else swi_base
-        else:
-            swi_use = swi_hi
+        for t, (v, inv) in enumerate(iter_tta(volume, level=tta_level)):
+            # Public stream
+            l_pub = np.asarray(swi_public(v))
+            l_pub = inv(l_pub)
+            logits_sum = l_pub.astype(np.float32) if logits_sum is None else (logits_sum + l_pub.astype(np.float32))
 
-        l_prv = np.asarray(swi_use(v))
-        l_prv = inv(l_prv)
-        s = binary_logit_from_multiclass_logits(l_prv, mode=mode)
-        s_sum = s.astype(np.float32) if s_sum is None else (s_sum + s.astype(np.float32))
+            # Private stream (high overlap for identity only)
+            if CFG["OV06_MAIN_ONLY"]:
+                swi_use = swi_hi if (t == 0) else swi_base
+            else:
+                swi_use = swi_hi
 
-        n += 1
+            l_prv = np.asarray(swi_use(v))
+            l_prv = inv(l_prv)
+            s = binary_logit_from_multiclass_logits(l_prv, mode=mode)
+            s_sum = s.astype(np.float32) if s_sum is None else (s_sum + s.astype(np.float32))
 
-    mean_logits = logits_sum / float(n)
+            n_total += 1
+
+    mean_logits = logits_sum / float(n_total)
     pub_labels = mean_logits.argmax(-1).astype(np.uint8).squeeze()
 
-    s_mean = (s_sum / float(n)).astype(np.float32, copy=False)
+    s_mean = (s_sum / float(n_total)).astype(np.float32, copy=False)
     prob = sigmoid_stable(s_mean)
     return pub_labels, prob
 
 # ── Warmup (JAX JIT compilation) ──────────────────────────
 def warmup(volume):
-    print("Warming up JAX (compile once)...")
-    _ = np.asarray(swi_public(volume))
-    _ = np.asarray(swi_base(volume))
-    _ = np.asarray(swi_hi(volume))
+    print(f"Warming up JAX for {len(swi_sets)} model(s) (compile once)...")
+    for mi, (swi_public, swi_base, swi_hi) in enumerate(swi_sets):
+        print(f"  Model {mi+1}/{len(swi_sets)}...")
+        _ = np.asarray(swi_public(volume))
+        _ = np.asarray(swi_base(volume))
+        _ = np.asarray(swi_hi(volume))
     print("Warmup done.")
 
 # ── Main inference loop ───────────────────────────────────
-print(f"\nConfig: overlap_public={CFG['overlap_public']}, overlap_base={CFG['overlap_base']}, "
-      f"overlap_hi={CFG['overlap_hi']}")
+print(f"\nConfig: {n_models} model(s), overlap_public={CFG['overlap_public']}, "
+      f"overlap_base={CFG['overlap_base']}, overlap_hi={CFG['overlap_hi']}")
 print(f"INK_MODE={CFG['INK_MODE']}, T_low={CFG['T_low']}, T_high={CFG['T_high']}")
 print(f"TTA={'ON (7-fold)' if CFG['USE_TTA'] else 'OFF'}, "
       f"OV06_MAIN_ONLY={CFG['OV06_MAIN_ONLY']}")

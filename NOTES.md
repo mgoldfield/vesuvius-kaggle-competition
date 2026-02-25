@@ -7,7 +7,7 @@ for active decision-making — keep this file lean.
 ## Competition
 - **Goal:** Detect papyrus surfaces in 3D CT scans of Herculaneum scrolls
 - **Metric:** `0.30*TopoScore + 0.35*SurfaceDice@tau=2 + 0.35*VOI_score`
-- **Deadline:** Feb 27, 2026 (3 days remaining)
+- **Deadline:** Feb 27, 2026 (2 days remaining)
 - **Submission:** Code competition — Kaggle notebook, GPU, ≤9hr, no internet
 - **Leaderboard:** 1,334 teams. Top score 0.607. Our best public: 0.504 (v20, TransUNet)
 - **Public test: only 1 volume** (ID 1407735). Scores are high-variance/unreliable.
@@ -135,561 +135,125 @@ names (vit, decoder, queries, head) instead of current all-or-nothing `--freeze-
 - **TTA level:** 7-fold (current), could add more augmentations or weight them differently.
 - **Overlap:** 0.42/0.43/0.60 (dual-stream). Higher overlap = better quality but slower.
 
-## Priorities (Feb 23-27, in order)
+## Priorities (Feb 24-27, revised)
 
-### Priority 1: Confirm close_erode PP (Feb 23)
-T_low sweeps running overnight on 20 volumes. If confirmed:
-- close_erode PP is locked in for ALL future submissions
-- **Re-evaluate ALL existing models with the new PP config** — model rankings may shift.
-  A model that's slightly worse at T_low=0.70 could be better at T_low=0.40 if it has
-  stronger connectivity. This must be done early before committing to a model.
+### Priority 1: Train on expanded pseudo-labeled data (Feb 24-25) — MAIN BET
+data-gpu is processing external scroll data from scrollprize.org → pseudo-labels via best model.
+Once complete, train on the expanded dataset (competition + external pseudo-labels).
+- This is our highest-leverage remaining experiment — more data is the most reliable way to improve.
+- After training, SWA blend with pretrained (70/30) and re-sweep T_low on the new model.
 
-### Priority 2: Pick best model + submit (Feb 23-24)
-- Review gpu2 margin_dist eval + SWA blend
-- Review gpu1 pseudo_margin2_cldice results when done
-- Re-evaluate top models with confirmed PP config
-- Submit best combination
+### Priority 2: Ensemble at inference (Feb 25-26)
+- Average logits from 2-3 diverse models (e.g., pretrained + margin_dist blend + cldice blend).
+- Orthogonal to training improvements, cheap to implement, typically +0.01-0.02.
+- Can be built in parallel with Priority 1.
 
-### Priority 3: Selective component unfreezing (Feb 23-24) — NEW
-- **Experiment A:** Unfreeze ViT only + clDice → connectivity improvement (48GB GPU)
-- **Experiment B:** Unfreeze decoder only + margin dist margin=1 → thinning (32GB GPU)
-- Runs on new GPUs, doesn't interfere with existing pipeline
-- Results in ~4 hours per experiment → SWA blend → eval
+### Priority 3: Train on all 786 volumes (Feb 25-26) — FINAL SUBMISSION
+- Final model: train on ALL data (including 82 val volumes) with best config.
+- ~10% more data + no val holdout penalty. Can't validate locally after this.
+- Must finalize hyperparams and PP config first.
 
-### Priority 4: Iterative pseudo-labeling (Feb 23-25)
-- Round-2 running on gpu2 now (clDice ep20 teacher → sharper pseudo-labels → retrain)
-- If improvement: consider round-3, or go straight to train-on-all-data
-- This is our highest-leverage training experiment
+### Priority 4: Kaggle hardening + final submissions (Feb 26-27)
+- Kaggle notebook hardening (memory, timing, error handling)
+- Final submissions with buffer for Kaggle queue (deadline Feb 27)
 
-### Priority 5: Train on all 786 volumes (Feb 25-26)
-- Final submission model: train on ALL data (including val) with best config
-- Must finalize hyperparams and PP config first (Priorities 1-4)
+### Completed / abandoned priorities
+- ~~Confirm close_erode PP~~ — DONE. erode_tl0.40_e1 best (+0.001-0.002 comp). Marginal.
+- ~~Selective component unfreezing~~ — DEAD END. ViT unfreeze blends at 0.5534, decoder at 0.5498.
+  Aggressive losses (dist_weight=1.0) don't learn at all. Pretrained encoder is hard to improve.
+- ~~Multi-model SWA~~ — DEAD END for comp. Pushes SDice but doesn't beat single 70/30 blend.
+- ~~Iterative pseudo-labeling (round 2 on gpu2)~~ — gpu2 abandoned (disk full).
 
-### Priority 5: Ensemble + hardening (Feb 26-27)
-- Average logits from best 2-3 models at inference
-- Kaggle notebook hardening, timing, error handling
-- Final submissions with buffer for Kaggle queue
+## Current Status (Feb 25, ~12:35 AM EST / 05:35 UTC)
 
-## Current Status (Feb 24, ~1:30 AM EST / 05:30 UTC)
+### FINAL PUSH PLAN (Feb 25-27, deadline Feb 27)
+
+Best local comp: **0.5551** (swa_70pre_30margin_dist_ep5, 24-vol cross-scroll).
+External data training produced ep10 at 0.5539 standalone cross-scroll (close but not better yet — needs SWA blend).
+
+| Step | Task | Duration | Status |
+|------|------|----------|--------|
+| 1 | SWA blend external ep4+ep10, eval cross-scroll | 30 min | **RUNNING** (ep10 eval in progress) |
+| 2 | Add `--train-all` flag to training script | 10 min | **DONE** |
+| 3 | Build ensemble inference in Kaggle notebook | 1 hour | **DONE** |
+| 4 | Train on all 786 volumes (no val holdout) | 5 hours | PENDING (waiting for user approval) |
+| 5 | Upload weights + submit to Kaggle | 2-3 hours | PENDING (blocked on #1,4) |
+
+**Code changes completed:**
+- `scripts/train_transunet.py`: Added `--train-all` flag — skips val split, trains on all 786 volumes, skips val eval + best model tracking
+- `kaggle/kaggle_notebook/vesuvius-inference.py`: Multi-model ensemble support — `ENSEMBLE_WEIGHTS` list in CFG, loads N models, averages logits across all models × TTA views before thresholding. Adaptive TTA timer auto-adjusts for ensemble overhead.
+
+### External data training results
+
+| Epoch | Comp (standalone val-only) | Comp (standalone cross-scroll) | SWA 70/30 cross-scroll | Notes |
+|-------|---------------------------|-------------------------------|----------------------|-------|
+| ep4 | 0.5285 | 0.5530 | OOM'd (~0.537 on 2 vols) | Won't beat ep10's 0.5536 |
+| ep7 | 0.5265 | — | — | |
+| ep10 | 0.5277 | 0.5539 | **0.5536** | Below best (0.5551) |
+| ep13 | 0.5264 | — | — | |
+| ep15 | 0.5266 | — | — | |
+
+**External data blending verdict:** SWA 70/30 of external_data_ep10 gives 0.5536 — below current best (0.5551).
+The external data model didn't improve enough over pretrained to beat the margin_dist blend.
+**Current best remains: swa_70pre_30margin_dist_ep5 at 0.5551.**
 
 ### GPU Fleet Status
 
-| GPU | Status | Task | Progress | ETA |
-|-----|--------|------|----------|-----|
-| gpu0 | Eval | Multi C eval (pseudo pair 60/20/20) | Vol 13/24 | ~7 min |
-| gpu1 | Training | `unfreeze_vit_highLR_resume` (from ep9) | Ep 4/6, step 650/704 | ~Feb 24 2AM EST |
-| gpu2 | **ABANDONED** | Disk full, cannot SSH | — | — |
-| gpu3 | Training | `unfreeze_vit_decoder_balanced` (combined ViT+decoder) | Ep 2/15, loss=1.4298 | ~Feb 24 2PM EST |
-| gpu4 | Training | `unfreeze_vit_dist_focus` (dist=1.0, cldice=0.3) | Ep 2/15, loss=1.7764 | ~Feb 24 2PM EST |
-| data-gpu | Running | External data pseudo-labeling | Other Claude | — |
-
-**NOTE:** Network to remote GPUs was spotty tonight (Feb 24). Confirmed all 3 are training
-at 1:30 AM EST. All runs under tmux — survive SSH drops.
-
-### Multi-model SWA blend results — COMPLETE
-
-| Blend | Pretrained | Fine-tuned models | Comp | SDice | Notes |
-|-------|-----------|-------------------|------|-------|-------|
-| **Best single** | 70% | 30% margin_dist_ep5 | **0.5551** | 0.8306 | Current best |
-| Best single (tie) | 70% | 30% pseudo_margin_dist_ep5 | 0.5551 | 0.8306 | Tied |
-| Multi D | 50% | 25% margin_dist + 25% cldice | 0.5549 | **0.8314** | Best SDice ever |
-| Multi B (5-model) | 50% | 15/15/10/10 spread | 0.5545 | 0.8311 | |
-| Multi A | 60% | 20% margin_dist + 20% cldice | 0.5543 | 0.8311 | |
-| Multi C (pseudo pair) | 60% | 20% pseudo_margin + 20% pseudo_cldice | RUNNING (13/24) | — | |
-
-**Conclusion:** Multi-model SWA doesn't beat best single blend on comp (0.5549 vs 0.5551).
-Pushes SDice to 0.8314 (best ever) but differences are within noise. Diminishing returns
-from adding more models. Best comp remains swa_70pre_30margin_dist_ep5.
-
-### gpu2 pseudo_frozen_margin_dist — EVAL COMPLETE
-
-| Epoch | Comp (standalone) | SDice | Notes |
-|-------|------------------|-------|-------|
-| ep5 | OOM'd during eval | — | |
-| ep10 | 0.5543 | 0.8294 | |
-| **ep15** | **0.5559** | **0.8308** | Best standalone |
-| ep20 | 0.5550 | 0.8304 | |
-| ep25 | 0.5552 | 0.8307 | |
-| SWA 70/30 ep15 | 0.5542 | — | Below current best |
-| SWA 70/30 ep5 | 0.5551 | 0.8306 | Ties best, better SDice |
-
-### T_low PP sweeps — ESSENTIALLY DONE (51/59)
-
-Both 20-vol sweeps at 51/59 configs. Results conclusive:
-
-| Probmaps | Best Config | Comp | vs base_tl0.70 |
-|----------|-------------|------|----------------|
-| SWA val | close_erode_tl0.40_c2_e1 | 0.5368 | +0.0018 |
-| Margin dist blend | erode_tl0.40_e1 | 0.5370 | +0.0014 |
-
-**Conclusion:** erode_tl0.40_e1 best PP (+0.001-0.002 comp). 2-vol dry-run was misleading.
-
-### Kaggle: All submissions score 0.504
-
-Public LB unreliable (1 test volume). Keep submitting best local val models.
-
-### gpu3 — Combined ViT+decoder unfreeze (NEW)
-
-**SSH:** `ssh -o StrictHostKeyChecking=no -i ~/.ssh/remote-gpu root@195.26.233.74 -p 32327`
-
-Completed: Exp 1 (ViT pure clDice, 15 ep), Exp 2 (ViT balanced, 15 ep total). All checkpoints on gpu0.
-- Exp 2 resume (7 ep from ep8): best val_loss=1.4268 (ep1/7 only improvement, then plateaued)
-- **NEW:** Combined ViT+decoder unfreeze with balanced losses. 15 epochs, LR=1e-5. Launching now.
-
-### gpu4 — ViT dist-focus unfreeze (NEW)
-
-**SSH:** `ssh -o StrictHostKeyChecking=no -i ~/.ssh/remote-gpu root@195.26.233.43 -p 53200`
-
-Completed: Exp 1 (Decoder margin dist, 15 ep), Exp 2 (Decoder balanced, 15 ep). All checkpoints on gpu0.
-- Decoder balanced: val_loss 1.7628→1.6512 over 15 ep (still converging but high vs ViT ~1.43)
-- **NEW:** ViT unfreeze with dist-focus (dist=1.0, cldice=0.3, margin=2). Tests if ViT benefits
-  more from distance-based thinning vs connectivity. 15 epochs, LR=1e-5. Launching now.
-
-### gpu1 — ViT high-LR resume (FINISHING SOON)
-
-**SSH:** `ssh -o StrictHostKeyChecking=no -i ~/.ssh/remote-gpu root@195.26.233.34 -p 39479`
-
-Original run: 9/15 epochs done before host outage. val_loss: 1.4406 (ep1 best) → 1.4520 (ep9, diverging).
-High LR (1e-4 = 10x) seems too aggressive — loss worse than standard 1e-5 runs.
-Resumed from ep9 for 6 more epochs. Last seen at ep 4/6, loss ~1.4540. Should finish ~2AM EST.
-All pseudo_margin2_cldice checkpoints (ep5-25) safely on gpu0.
-**TODO:** Pull resume checkpoints when done, create SWA blends, eval.
-
-### data-gpu — External data pseudo-labeling (NEW)
-
-**SSH:** `ssh -o StrictHostKeyChecking=no -i ~/.ssh/remote-gpu root@195.26.233.98 -p 31182`
-RTX 6000 Ada 48GB. Codebase, model weights, pretrained weights all synced.
-Task doc: `EXTERNAL_DATA_TASK.md`. Needs venv setup (INSTALLATION.md has instructions).
-Other Claude instance starting on this GPU.
-
-### Eval queue on gpu0
-
-Currently running: Multi C (pseudo pair 60/20/20), 13/24 vols. Queue after:
-1. ViT balanced ep9 — `swa_70pre_30unfreeze_vit_balanced_ep9.weights.h5`
-2. ViT high-LR ep1 — `swa_70pre_30unfreeze_vit_highLR_ep1.weights.h5`
-3. Decoder balanced ep5 — `swa_70pre_30unfreeze_decoder_balanced_ep5.weights.h5`
-4. Decoder balanced ep10 — `swa_70pre_30unfreeze_decoder_balanced_ep10.weights.h5`
-5. New checkpoints from gpu1/3/4 as they come in (gpu1 finishing soon)
-
-**Completed evals this session (in order):**
-- pseudo_margin2_cldice ep10: comp=0.5545
-- pseudo_margin2_cldice ep15: comp=0.5548
-- Multi D (50/25/25): comp=0.5549, SDice=0.8314
-- Multi B (5-model): comp=0.5545
-- Multi C (pseudo pair): RUNNING
-
-### Additional evals completed this session
-
-| Model | Comp | SDice | Notes |
-|-------|------|-------|-------|
-| swa_70pre_30pseudo_margin2_cldice_ep10 | 0.5545 | 0.8304 | Marginal vs ep5 (0.5547) |
-| swa_70pre_30pseudo_margin2_cldice_ep15 | 0.5548 | 0.8308 | Best pseudo-label SWA blend |
-| multi 50/25/25 (D) | 0.5549 | **0.8314** | Best SDice ever |
-| multi 5-model (B) | 0.5545 | 0.8311 | Diminishing returns |
-| multi C (pseudo pair) | RUNNING | — | 13/24 vols |
-
-**If chain fails or only Exp 1 ran:**
-```bash
-ssh -i ~/.ssh/remote-gpu root@195.26.233.43 -p 52276
-tmux list-sessions
-cat logs/unfreeze_decoder_margin1.log | tail -20
-cat logs/unfreeze_decoder_balanced.log | tail -20
-# Re-launch exp 2 if needed
-tmux new-session -d -s train 'cd /workspace/vesuvius-kaggle-competition && bash launch_gpu4_unfreeze_decoder_balanced.sh'
-```
-
-#### 4. Code change: --unfreeze flag
-
-Added to `scripts/train_transunet.py`:
-- `--unfreeze` CLI arg (line 376): accepts component names: vit, decoder, queries, head, cnn
-- Selective freeze/unfreeze logic (line ~450-484): freezes ALL layers, then unfreezes named components
-- Training loop guard fix (line ~606): `if not args.freeze_encoder and not args.unfreeze:` prevents
-  resetting trainable state each epoch when using selective unfreezing
-
-#### 5. All scripts on disk
-
-| Script | Purpose | Location |
-|--------|---------|----------|
-| Eval chain | Eval gpu2 checkpoints | `/tmp/eval_gpu2_and_blend.sh` |
-| SWA blend fix | Fix broken comp extraction | `/tmp/fix_eval_swa_blend.sh` |
-| gpu3 exp 1 | ViT + pure clDice | `/tmp/launch_gpu3_unfreeze_vit.sh` |
-| gpu3 exp 2 | ViT + clDice balanced | `/tmp/launch_gpu3_unfreeze_vit_balanced.sh` |
-| gpu3 chain | Runs exp 1 → exp 2 | `/tmp/launch_gpu3_chain.sh` |
-| gpu4 exp 1 | Decoder + pure margin dist | `/tmp/launch_gpu4_unfreeze_decoder.sh` |
-| gpu4 exp 2 | Decoder + margin dist balanced | `/tmp/launch_gpu4_unfreeze_decoder_balanced.sh` |
-| gpu4 chain | Runs exp 1 → exp 2 | `/tmp/launch_gpu4_chain.sh` |
-| Chain followup gpu3 | Sync balanced scripts + restart with chain | `/tmp/chain_followup_gpu3.sh` |
-| Chain followup gpu4 | Sync balanced scripts + restart with chain | `/tmp/chain_followup_gpu4.sh` |
-| Monitor | 5-min status checks | `/tmp/monitor_overnight.sh` |
-
-### Completed
-- **Margin distance training** on gpu0 — DONE. Best: ep5 (comp=0.5500, topo=0.2679).
-- **clDice pseudo-label training** on gpu2 — DONE (25 epochs). Eval DONE (see results below).
-- **SWA connectivity PP sweep** — DONE. No connectivity method beat baseline on SWA probmaps.
-- **Competitor research** — See `COMPETITOR_RESEARCH_FEB22.md`.
-- **v23 Kaggle submission** — Adaptive TTA timer. Completed on Kaggle.
-- **clDice eval + probmap gen** — DONE at 22:02 UTC.
-- **gpu1 pseudo_frozen_boundary training** — DONE (25 epochs, loss=0.911).
-  Checkpoints pulled to gpu0. Watcher eval ran but may have incomplete results.
-- **SWA blends created + evaluated:**
-  - `swa_70pre_30margin_dist_ep5`: **comp=0.5551**, topo=0.2477, SDice=0.8299. **NEW BEST MODEL.**
-  - `swa_70pre_30cldice_ep20`: comp=0.5543, topo=0.2389, SDice=0.8308. Better SDice but worse topo.
-- **gpu2 pseudo_frozen_margin_dist training** — DONE (25 epochs, completed 03:35 UTC).
-  Checkpoints pulled to gpu0: ep5, ep10, ep15, ep20, ep25.
-- **New best model probmaps generated** — 82 val volumes from swa_70pre_30margin_dist_ep5.
-  Dir: `data/swa_70pre_30margin_dist_ep5_probmaps/`
-- **Kaggle v24 submitted** — new best model + close_erode PP (T_low=0.40). Running on Kaggle.
-
-### All SWA blend evaluation results (Feb 23)
-
-| Model | Comp | SDice | Notes |
-|-------|------|-------|-------|
-| **swa_70pre_30margin_dist_ep5** | **0.5551** | 0.8299 | **CURRENT BEST** (original labels) |
-| swa_70pre_30pseudo_margin_dist_ep5 | 0.5551 | 0.8306 | Ties best (pseudo-labels), better SDice |
-| swa_70pre_30topo_ep5 | 0.5549 | 0.8291 | Previous best (frozen_boundary) |
-| pseudo_margin2_cldice_ep5 (standalone) | 0.5547 | 0.8300 | gpu1, not SWA blended |
-| pseudo_frozen_cldice_ep20 (standalone) | 0.5546 | 0.8304 | Best SDice standalone |
-| swa_70pre_30cldice_ep20 | 0.5543 | 0.8308 | |
-| swa_70pre_30pseudo_margin_dist_ep15 | 0.5542 | — | |
-| swa_70pre_30unfreeze_vit_cldice_ep5 | 0.5534 | 0.8277 | ViT unfreeze (gpu3) |
-| swa_70pre_30unfreeze_vit_balanced_ep5 | 0.5534 | 0.8277 | ViT unfreeze balanced (gpu3) |
-| swa_70pre_30unfreeze_decoder_margin1_ep5 | 0.5498 | 0.8126 | Decoder unfreeze (gpu4) — degraded |
-| swa_70pre_30pseudo_margin2_cldice_ep10 | 0.5545 | 0.8304 | gpu1 pseudo labels, ep10 |
-| swa_70pre_30pseudo_margin2_cldice_ep15 | 0.5548 | 0.8308 | gpu1 pseudo labels, ep15 |
-| multi 50/25/25 (margin+cldice) | 0.5549 | **0.8314** | Best SDice ever |
-| multi 5-model (50/15/15/10/10) | 0.5545 | 0.8311 | |
-| multi 60/20/20 (margin+cldice) | 0.5543 | 0.8311 | |
-
-**Key insight:** SWA 70/30 blends consistently land at 0.553-0.555 regardless of fine-tuned model.
-Pretrained weights dominate. Multi-model SWA pushes SDice but doesn't improve comp.
-
-### Selective unfreezing results summary
-
-| Experiment | Component | Loss | Comp (SWA 70/30) | Status |
-|------------|-----------|------|-------------------|--------|
-| gpu3 exp 1 | ViT | pure clDice | 0.5534 | Done (15 ep) |
-| gpu3 exp 2 | ViT | balanced clDice | 0.5534 | Done (15 ep, resumed) |
-| gpu4 exp 1 | Decoder+head | margin dist | 0.5498 | Done (15 ep) |
-| gpu4 exp 2 | Decoder+head | balanced | pending eval | Done (15 ep) |
-| gpu1 highLR | ViT | balanced, LR=1e-4 | pending eval | 9/15 ep done, resuming 6 more (ep 4/6) |
-| **gpu3 NEW** | **ViT+Decoder** | balanced clDice | — | **Training ep 2/15, loss=1.4298** |
-| **gpu4 NEW** | **ViT** | **dist focus** (dist=1.0) | — | **Training ep 2/15, loss=1.7764** |
-
-ViT unfreezing underperformed with 70/30 blend but may benefit from:
-- Higher fine-tune ratio (50/50, 60/40)
-- Higher LR (gpu1 testing 1e-4 vs gpu3's 1e-5)
-- Later epoch selection (ep10/15 instead of ep5)
-
-**Key finding:** clDice ep20 nearly matches our best SWA blend (0.5546 vs 0.5549) and has
-**better SDice** (0.8304 vs 0.8291). Strong SWA blend candidate.
-ep5 OOM'd during eval. Results: `logs/eval_pseudo_frozen_cldice_results.csv`
-
-### T_low PP sweep — PRELIMINARY (2-vol only, needs confirmation)
-
-| Config | Comp | Topo | SDice | VOI | FG% |
-|--------|------|------|-------|-----|-----|
-| **close_erode_tl0.40_c1_e1** | **0.5595** | **0.3357** | 0.7800 | 0.5307 | 10.2% |
-| B_dme_tl0.4_r1 | 0.5346 | 0.3285 | 0.7049 | 0.5410 | 14.8% |
-| base_tl0.40 | 0.5251 | 0.2998 | 0.7021 | 0.5413 | 14.6% |
-| *baseline_t70 (current)* | *0.5350* | *0.2277* | *0.7907* | *0.5427* | — |
-
-**WARNING: These results are from only 2 volumes.** Full 20-volume sweeps now running on both
-old SWA and new best model probmaps to confirm. Pattern: low T_low → closing bridges gaps →
-erosion thins back → connected AND thin.
-
-### gpu0: Eval gpu2 pseudo_frozen_margin_dist — RUNNING (GPU)
-
-Script: `/tmp/eval_gpu2_and_blend.sh` | Log: `logs/eval_gpu2_margin_dist.log`
-Evaluating 5 checkpoints (ep5/10/15/20/25), then SWA blend best → eval.
-Currently on ep10. ETA ~06:00 UTC for all evals, ~07:00 for blend.
-
-### gpu0: T_low PP sweeps (CPU) — RUNNING
-
-Two parallel sweeps, 59 configs × 20 volumes each (~10-13 hours):
-1. **Old SWA probmaps** (`swa_70_30_val_probmaps`): Log: `logs/tlow_pp_swa_val_20vols.log`
-2. **New best model probmaps** (`swa_70pre_30margin_dist_ep5_probmaps`): Log: `logs/tlow_pp_margin_dist_blend_20vols.log`
-
-ETA: results by ~14:00-17:00 UTC (9 AM - 12 PM ET)
-
-### gpu0: Old connectivity PP sweep (CPU) — RUNNING
-
-Pretrained sweep still in progress. Log: `logs/connectivity_pp_pretrained_sweep.log`
-
-### gpu1: DUAL — pseudo_margin2_cldice DONE + unfreeze_vit_highLR RUNNING
-
-**pseudo_margin2_cldice** — COMPLETE (25/25 epochs, 8.6 hours).
-Checkpoints pulled to gpu0 (ep5/10/15/20/25). Evaluating ep5 now on gpu0.
-
-**unfreeze_vit_highLR** — RUNNING (ep 1/15, launched 17:22 UTC).
-Config: ViT unfreeze (26.3M params), LR=1e-4, balanced loss (cldice=1.5, skel=0.75, fp=0.50,
-boundary=0.3). 15 epochs, ~2.2 hr/epoch. ETA: ~Feb 24 ~02:00 EST.
-**SSH:** `ssh -i ~/.ssh/remote-gpu root@195.26.233.34 -p 39422`
-
-### gpu2: Round-2 resume training — RUNNING (ep 2/20)
-
-Round-2 training resumed from ep5 checkpoint with reduced cldice-iters=3 (was 5, OOM'd).
-Tmux session: `round2` | Log: `logs/pseudo_r2_cldice_resume.log`
-Config: frozen encoder, SWA init, cldice=0.5, cldice-iters=3, boundary=0.3, fp=1.5, skel=0.75.
-**WARNING:** val_loss=nan on ep1. Monitor for stability.
-**SSH:** `ssh -i ~/.ssh/remote-gpu root@195.26.233.87 -p 25763`
-
-### Competition scores
-- v22 (SWA best) scored **0.504** — same as v20/v21. Single public test volume.
-- v24 (margin_dist blend + close_erode PP) — RUNNING on Kaggle.
-- Top score on LB: 0.607.
-
-### Margin distance training results (COMPLETE)
-
-| Model | Comp | Topo | SDice | VOI | n |
-|-------|------|------|-------|-----|---|
-| swa_70pre_30topo_ep5 (baseline) | 0.5526 | 0.2354 | 0.8255 | 0.5517 | 24 |
-| **frozen_margin_dist_ep5** | **0.5500** | **0.2679** | 0.8069 | 0.5350 | 24 |
-| frozen_margin_dist_ep15 | 0.5482 | 0.2616 | 0.8059 | 0.5361 | 24 |
-| frozen_margin_dist_best | 0.5470 | 0.2622 | 0.8022 | 0.5358 | 24 |
-| frozen_margin_dist_ep10 | 0.5463 | 0.2650 | 0.7997 | 0.5341 | 24 |
-
-**Key finding:** ep5 has the **best topo score of any model** (0.2679 vs frozen_boundary's 0.2642).
-Same pattern: early epochs best for SWA blending. Strong SWA blend candidate.
-Results: `logs/eval_frozen_margin_dist_results.csv`
-
-### SWA connectivity PP sweep results (COMPLETE — disappointing)
-
-No connectivity method beat simple baselines on SWA probmaps:
-
-| Config | Comp | Topo | SDice | VOI |
-|--------|------|------|-------|-----|
-| baseline_t70 | **0.5350** | 0.2277 | 0.7907 | 0.5427 |
-| B_dme_tl0.7_r1 | 0.5345 | 0.2273 | 0.7909 | 0.5414 |
-| baseline_t50 | 0.5328 | 0.2365 | 0.7616 | 0.5579 |
-| D_combo_bd3_i2 | 0.5270 | 0.2156 | 0.7846 | 0.5364 |
-
-Results: `logs/connectivity_pp_swa_70_30_val_probmaps.csv`
-Pretrained + dist_sq sweeps still running — thinner models may benefit more from connectivity PP.
-
-### clDice pseudo-label training (COMPLETE — eval pending)
-
-25 epochs completed on gpu2. Loss plateaued at ~1.052 from ep11. Checkpoints pulled to gpu0.
-Eval running now. Checkpoints: `checkpoints/transunet_pseudo_frozen_cldice/`
-Config: frozen encoder, SWA weights, pseudo-labels, cldice=0.5, iters=5.
-
-### Margin distance loss (implemented Feb 22)
-
-Replaces dist_sq with a margin-based variant: `penalty = max(0, dist - margin)^power`.
-Voxels within `margin` voxels of the skeleton get zero penalty (free zone). Beyond that,
-penalty ramps up. With margin=3, surfaces up to ~6 voxels thick incur no penalty.
-
-**Code changes** (on gpu0 and gpu2, NOT gpu1):
-- `_generate_dist_from_skeleton` now returns raw voxel distances capped at 10 (was [0,1] normalized).
-- `build_loss` accepts `dist_margin` parameter, applies `keras.ops.relu(dist - margin)`.
-- CLI: `--dist-margin` flag (default 0.0 = backward compatible with old dist_sq).
-- **Weight scaling:** Old dist-weight=2.0 was calibrated for [0,1] distances. With raw voxels,
-  dist-weight ~0.02-0.05 gives similar gradient magnitude. At w=0.02, margin dist contributes
-  ~15-20% of total loss.
-
-### Pseudo-labeling pipeline (stages 1-2 complete)
-
-Uses best model's high-confidence predictions to convert unlabeled voxels (label=2,
-~52% of each volume) into training signal. 80.4% of unlabeled voxels converted at
-0.85/0.15 thresholds, FG nearly doubles.
-
-**Stages 1-2 COMPLETE:** 704 probmaps (42 GB) + 704 pseudo-labels (21 GB) generated.
-
-### Kaggle v22 (submitted Feb 22 03:42 UTC)
-
-Updated inference to use SWA best weights (swa_70pre_30topo_ep5, local val 0.5549).
-Score **PENDING** — check with `kaggle competitions submissions -c vesuvius-challenge-surface-detection`
-
-### Disk usage (gpu0)
-
-~175 GB / 350 GB used (adding clDice checkpoints 2.2 GB + new probmap dirs).
-
-## SWA Weight Averaging — current best approach
-
-Blending pretrained + fine-tuned weights at 70/30 ratio is the only approach that beats pretrained.
-This is our primary model improvement strategy. After pseudo-label training completes, we should
-SWA blend the best pseudo-label checkpoint with pretrained (same 70/30 recipe).
-
-**Topo-focused blends (frozen_boundary source):**
-
-| Model | Comp | Topo | SDice | VOI | n |
-|-------|------|------|-------|-----|---|
-| pretrained (baseline) | 0.5526 | 0.2354 | 0.8255 | 0.5517 | 24 |
-| swa_90pre_10topo (ep10) | 0.5544 | 0.2403 | 0.8285 | 0.5496 | 24 |
-| swa_70pre_30topo (ep10) | 0.5545 | 0.2490 | 0.8301 | 0.5407 | 24 |
-| **swa_70pre_30topo_ep5** | **0.5549** | 0.2499 | 0.8291 | 0.5420 | 24 |
-| swa_70pre_30sdice_ep15 | 0.5548 | 0.2489 | 0.8301 | 0.5418 | 24 |
-
-**Key findings:**
-- 70/30 ratio is the sweet spot (consistent across dist_sq and frozen_boundary blends)
-- Topo improvement is substantial (+0.014) with SDice maintained or improved
-- ep5 slightly outperforms ep10 in the blend despite ep10 having better individual topo
-- Pure fine-tuned weights are much worse — pretrained carries most value
-
-Results: `logs/eval_swa_topo_results.csv`, `logs/eval_swa_results.csv`
-Weights: `checkpoints/swa_topo/`
-Script: `scripts/swa_blend.py`
-
-## Fine-Tuning Experiments (completed, inform future work)
-
-All fine-tuned models degrade SDice vs pretrained. Frozen encoder consistently better than
-discriminative LR. These results inform pseudo-label training strategy (frozen encoder, boundary loss).
-
-| Model | Best Comp | Best Topo | Best SDice | Strategy |
-|-------|-----------|-----------|------------|----------|
-| frozen_boundary (gpu2) | 0.5408 (ep10) | **0.2642** (ep10) | 0.7871 (ep15) | Frozen encoder |
-| frozen_dist_sq (gpu2) | 0.5402 (ep25) | 0.2634 (ep25) | 0.7885 (ep10) | Frozen encoder |
-| discrim_boundary (gpu1) | 0.5286 (ep15) | 0.2342 (ep15) | 0.7836 (ep15) | Discriminative LR |
-| discrim_dist_sq (gpu1) | 0.5269 (ep25) | 0.2292 (ep15/25) | 0.7841 (ep25) | Discriminative LR |
-
-Results: `logs/eval_frozen_boundary_results.csv`, `logs/eval_discrim_boundary_results.csv`, etc.
-
-## PP Sweep Findings (inform future PP tuning)
-
-26 configs on pretrained probmaps (82 vols) + 26 configs on dist_sq probmaps.
-
-**Key findings:**
-- **T_low is the only meaningful PP parameter.** Closing, dust removal, confidence filtering = noise (±0.001).
-- **Optimal T_low depends on the model.** Pretrained optimal T_low=0.70, dist_sq optimal T_low=0.30-0.40.
-  Thinner predictions need lower threshold to preserve connectivity.
-- **PP barely helps fine-tuned models.** Best fine-tuned PP config = 0.506 vs pretrained's 0.553. Gap is in the model.
-- **After pseudo-label training, re-sweep T_low** on the new model — optimal value will likely shift.
-
-Results: `logs/postprocessing_sweep.csv`, `logs/sweep_pp_dist_sq_results.csv`
-
-## Prediction Thickness (core problem, ongoing)
-
-**Problem:** Model predicts 15-30% foreground per volume vs GT's 2-8%. Surfaces are 3-5x too thick.
-Confirmed from exploration notebook: probmaps themselves are thick (model-level, not PP artifact).
-
-**Impact on metrics:**
-- **SDice (35%):** Thick slabs create two boundary surfaces; one aligns with GT, other is penalized.
-- **VOI (35%):** Excess voxels increase conditional entropy; thickness merges nearby surfaces.
-- **Topo (30%):** Merged surfaces change component count and create false tunnels.
-
-**What we've tried:**
-- dist_sq loss (quadratic penalty far from skeleton) — partial improvement, best topo=0.2642
-- Frozen encoder + boundary loss — best at preserving topo while thinning
-- SWA blending — 30% fine-tuned dose thins slightly without destroying SDice
-- Ridge thinning PP — **destroys topology** (topo 0.29→0.005). PP can't thin safely.
-- clDice — needs 48GB VRAM. Testing on gpu2 with pseudo-labels.
-
-**Remaining approaches — training:**
-- **Pseudo-labeling** (active) — expanded training signal may help model learn sharper boundaries
-- **clDice + pseudo-labels** (active, gpu2) — soft-skeletonization loss directly measures thin alignment
-- **Margin distance loss** (implemented Feb 22) — replaces dist_sq. Free zone of `margin` voxels
-  around skeleton (zero penalty), then `(dist - margin)^power` beyond. `--dist-margin 3` allows
-  ~6-voxel thick surfaces with no penalty, aggressively penalizes thick tails.
-  **NOTE:** Distance normalization changed — `_generate_dist_from_skeleton` now returns raw voxel
-  distances (capped at 10) instead of normalized [0,1]. Old `--dist-weight 2.0` was calibrated
-  for normalized distances. With raw voxels + margin=3 + power=2, a voxel at dist=7 contributes
-  `(7-3)^2 = 16` vs old `(0.7)^2 * w = 0.98`. **Scale `--dist-weight` down ~30x** (e.g., 0.05-0.1)
-  to get similar gradient magnitude. Or tune from scratch since this is a different loss shape.
-- **Higher boundary loss weight** — currently 0.3. Could try 0.5-1.0 to squeeze predictions
-  from the edges more aggressively. Boundary loss is complementary to dist_sq: dist_sq says
-  "be near the center", boundary loss says "don't extend past the edges".
-
-**Remaining approaches — post-processing:**
-- **Connectivity PP** — implemented in `scripts/sweep_connectivity_pp.py`. Dry-run verified (2 vols).
-  4 methods: (A) probmap-guided gap filling, (B) dilate-merge-erode, (C) two-pass hysteresis,
-  (D) combined C→A→bridge cleanup. ~30 configs total. Full sweep on pretrained probmaps (82 vols)
-  takes ~2 hrs CPU-only. Dry-run results (2 vols, preliminary):
-  - D_combo comp=0.5433 (best), B_dme comp=0.5411, baseline_t50 comp=0.5194
-  - Methods B and D reduce FG% (10-12% vs baseline 15%) while improving SDice
-  - Methods A and C alone thicken too much (20% FG) at t_low_strict=0.70; t_low_strict=0.80 untested
-
-Visual analysis: `notebooks/analysis/multi_model_comparison.ipynb`
-
-## Strategy (Feb 22 → Feb 27)
-
-### Phase 1: Training + eval (Feb 22-23) — MOSTLY COMPLETE
-- [x] Generate pseudo-labels (stages 1-2)
-- [x] Margin distance training on gpu0 (original labels)
-- [x] clDice pseudo-label training on gpu2 — DONE, eval DONE
-- [x] Pseudo-label training WITHOUT clDice on gpu1 (`pseudo_frozen_boundary`) — DONE
-- [x] clDice eval + probmap gen — DONE
-- [x] SWA blends created + evaluated — margin_dist_ep5 is NEW BEST (0.5551)
-- [x] gpu2 `pseudo_frozen_margin_dist` — DONE, checkpoints pulled to gpu0
-- [x] Generate probmaps from new best model — DONE (82 val volumes)
-- [ ] gpu1 `pseudo_margin2_cldice` (margin=2 + clDice) — TRAINING ep 2/25 (ETA 11:00 UTC)
-- [ ] Eval gpu2 pseudo_frozen_margin_dist checkpoints — RUNNING on gpu0
-- [ ] SWA blend gpu2 best checkpoint → eval — queued
-
-### Phase 1.5: T_low + PP sweep + submit (Feb 23)
-- [x] Integrate close_erode PP into Kaggle notebook (T_low=0.40)
-- [x] **Submit v24** — new best model + close_erode PP — RUNNING on Kaggle
-- [ ] T_low sweep on old SWA probmaps (20 vols, 59 configs) — RUNNING (ETA ~17:00 UTC)
-- [ ] T_low sweep on new best model probmaps (20 vols, 59 configs) — RUNNING (ETA ~17:00 UTC)
-- [ ] Review sweep results → potentially resubmit with tuned config
-- **NOTE:** 2-vol dry-run showed close_erode at 0.5595 but needs 20-vol confirmation
-
-### Phase 2: Confirm PP + re-evaluate models (Feb 23-24)
-- [ ] Review T_low sweep results (20 vols) → confirm close_erode PP config
-- [ ] **Re-evaluate top models with new PP config** — rankings may shift at T_low=0.40
-- [ ] Pick best model + PP combination → submit
-- [ ] Review gpu1 pseudo_margin2_cldice → SWA blend → eval with new PP
-
-### Phase 2.5: Iterative pseudo-labeling (Feb 23-25) — RUNNING on gpu2
-
-Round-2 pipeline launched: clDice ep20 (best SDice) → sharper pseudo-labels → retrain.
-1. Generate round-2 probmaps (704 vols, ~16s/vol) — RUNNING, ETA ~07:15 UTC
-2. Threshold at 0.85/0.15 → round-2 pseudo-labels — queued
-3. Train on round-2 pseudo-labels (25 epochs, cldice=0.5, boundary=0.3) — queued
-4. SWA blend best round-2 checkpoint with pretrained (70/30)
-5. Optionally iterate (round-3) if time allows
-
-**Expected benefit:** Round-1 pseudo-labels from pretrained (SDice=0.8255). Round-2 from
-clDice ep20 (SDice=0.8304) → ~5% sharper boundaries. Knowledge distillation with better teacher.
-
-### Phase 3: Train on all data — FINAL SUBMISSION (Feb 25-26)
-
-Train on ALL 786 volumes (including 82 val) with best config. ~10% more data + no val holdout
-penalty. Must finalize all hyperparams and PP first (can't validate locally).
-
-**Pipeline:**
-1. Finalize best loss config, LR, epochs from earlier experiments
-2. Generate pseudo-labels for ALL 786 volumes (not just 704 non-val)
-3. Train on all 786 volumes with best loss config, frozen encoder
-4. SWA blend with pretrained (70/30)
-5. Apply best PP config (from T_low sweep)
-6. Submit to Kaggle — this is the FINAL model
-
-**Timing:** Must start by Feb 25 to allow training + Kaggle queue time.
-
-### Phase 4: Ensemble + hardening (Feb 26-27)
-- [x] **Adaptive TTA timer** — DONE (v23). Auto-reduces 7→4→1 fold TTA.
-- [ ] Ensemble best 2-3 models (logit averaging at inference). Cheap +0.01-0.02 boost.
-- [ ] Kaggle notebook hardening (memory, timing, error handling)
-- [ ] Final submissions with buffer for Kaggle queue (deadline Feb 27)
-
-### Ideas on deck (if time allows)
-- [ ] **Multi-scale inference fusion** — 128^3 + 160^3 averaged
-- [ ] **External scroll data** — scrollprize.org (see notes below). High effort, low priority.
-- [ ] **Frangi filter PP** — Hessian-based sheet enhancement (from competitor research)
-- [ ] **Multi-model SWA** — blend pretrained + 2-3 fine-tuned (e.g., 60/20/20)
-
-### External data: scrollprize.org (research notes)
-
-6 full scrolls available with CT scans + OBJ surface meshes at scrollprize.org.
-This is NOT the same format as competition data — would require significant processing:
-
-**What we'd need to do:**
-1. Download CT volumes (massive — each scroll is hundreds of GB of raw .tif slices)
-2. Download OBJ surface meshes (ground truth surface locations)
-3. Chunk CT into 320^3 overlapping patches (like competition format)
-4. Convert OBJ mesh → binary voxel labels for each 320^3 patch
-5. Quality-check: ensure labels are thin (1-2 voxels) like competition GT
-
-**Can we process a section?** Yes — we could download just one scroll section (a few hundred
-slices out of thousands) and generate 50-100 volumes. This would be much faster than the
-full dataset.
-
-**Feasibility assessment:**
-- Mesh-to-voxel conversion is non-trivial (needs proper coordinate alignment)
-- Label thickness would need to match competition (1-2 voxels, not solid)
-- Download size is the main bottleneck (even one section is many GB)
-- Time estimate: 1-2 days including debugging, which is tight for our deadline
-- **Recommendation:** Only attempt if iterative pseudo-labeling (Phase 2.5) doesn't
-  give enough improvement. Pseudo-labeling is much faster and lower risk.
+| GPU | Status | Task |
+|-----|--------|------|
+| gpu0 | **ACTIVE** | SWA blending + eval, then train-all |
+| gpu1 | SHUT DOWN | All checkpoints pulled |
+| gpu2 | ABANDONED | Disk full |
+| gpu3 | SHUT DOWN | All checkpoints pulled |
+| gpu4 | SHUT DOWN | All checkpoints pulled |
+| data-gpu | SHUT DOWN | External data + pseudo-labels complete |
+
+### Completed experiments (details in HISTORY.md)
+- Margin distance training, clDice pseudo-label training, SWA connectivity PP sweep
+- All SWA blend evaluations (Feb 23) — best: swa_70pre_30margin_dist_ep5 (0.5551)
+- Selective unfreezing (DEAD END), Multi-model SWA (DEAD END for comp)
+- T_low PP sweeps (erode_tl0.40_e1 best, +0.001-0.002)
+- gpu2 pseudo_frozen_margin_dist eval
+- Pseudo-labeling pipeline (704 volumes)
+- Fine-tuning experiments (frozen encoder > discriminative LR)
+- PP sweep findings, connectivity PP (disappointing)
+
+## Strategy — FINAL PUSH (Feb 25-27)
+
+### Step 1: SWA Blend External Data ep4+ep10 (~30 min) — IN PROGRESS
+Create 70/30 blend of pretrained + external_data ep10 (and ep4), eval cross-scroll.
+External ep10 standalone was 0.5539, ep4 was 0.5530 — SWA blend should push higher.
+
+### Step 2: Build Ensemble Inference (~2 hours coding + eval) — PENDING
+Modify Kaggle notebook to support 2-model ensemble (average logits before thresholding).
+Timing: with 2 models + adaptive TTA, should still fit in 9hr Kaggle limit.
+Test locally with eval_transunet.py modified to average logits from 2 models.
+
+### Step 3: Train on All 786 Volumes (~5 hours) — PENDING
+Train with NO val holdout — all 786 competition volumes. Best config:
+- Frozen encoder, SWA init (swa_70pre_30margin_dist_ep5)
+- dist_weight=0.1, dist_margin=3, boundary=0.3, skel=0.75, fp=0.5
+- 15 epochs, LR=5e-5, grad-accum=4
+- New `--train-all` flag skips val split
+After training: SWA blend best epoch with pretrained at 70/30.
+**Cannot validate locally after this — flying blind.**
+
+### Step 4: Upload + Submit to Kaggle (~2-3 hours) — PENDING
+1. Copy final weights to `kaggle/kaggle_weights_download/`
+2. Upload dataset, push notebook, monitor
+3. Submit multiple variants if time allows (single model vs ensemble)
+
+### Completed phases (prior sessions)
+- [x] Phase 1: All training + eval experiments complete
+- [x] Phase 2: External data pseudo-labeling + training (15 epochs)
+- [x] T_low PP sweeps — erode_tl0.40_e1 best (+0.001-0.002)
+- [x] Selective unfreezing — DEAD END
+- [x] Multi-model SWA — DEAD END for comp
+- [x] Adaptive TTA timer (v23)
+
+### External data from scrollprize.org — DONE
+External scroll data downloaded and processed into pseudo-labeled training volumes.
+Training completed (15 epochs). See external data training results above.
 
 ## Kaggle Submission Quick Reference
 ```bash

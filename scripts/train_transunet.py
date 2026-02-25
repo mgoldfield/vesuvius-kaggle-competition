@@ -380,6 +380,9 @@ def main():
                              'Overrides --freeze-encoder if both specified.')
     parser.add_argument('--discriminative-lr', action='store_true',
                         help='Use per-layer-group LRs: encoder=lr/100, decoder=lr/10, head=lr')
+    parser.add_argument('--train-all', action='store_true',
+                        help='Train on ALL volumes (no val holdout). For final submission only — '
+                             'cannot validate locally after this.')
     args = parser.parse_args()
 
     if args.dry_run:
@@ -412,27 +415,34 @@ def main():
                 set(int(p.stem) for p in TRAIN_LBL.glob("*.tif"))
     train_df = train_df[train_df.id.isin(available)]
 
-    val_ids = train_df[train_df.scroll_id == VAL_SCROLL].id.tolist()
-    train_ids = train_df[train_df.scroll_id != VAL_SCROLL].id.tolist()
+    if args.train_all:
+        train_ids = train_df.id.tolist()
+        val_ids = []
+        print(f"--train-all: using ALL {len(train_ids)} volumes for training (no validation)")
+    else:
+        val_ids = train_df[train_df.scroll_id == VAL_SCROLL].id.tolist()
+        train_ids = train_df[train_df.scroll_id != VAL_SCROLL].id.tolist()
 
     if args.dry_run:
         train_ids = train_ids[:5]
-        val_ids = val_ids[:2]
+        val_ids = val_ids[:2] if val_ids else []
 
     print(f"Train: {len(train_ids)} volumes, Val: {len(val_ids)} volumes")
 
     # ── DataLoaders ──
     train_ds = VesuviusPatchDataset(train_ids, train=True)
-    val_ds = VesuviusPatchDataset(val_ids, train=False)
 
     train_loader = DataLoader(
         train_ds, batch_size=1, shuffle=True, num_workers=2,
         collate_fn=collate_fn, pin_memory=False,
     )
-    val_loader = DataLoader(
-        val_ds, batch_size=1, shuffle=False, num_workers=0,
-        collate_fn=collate_fn, pin_memory=False,
-    )
+    val_loader = None
+    if val_ids:
+        val_ds = VesuviusPatchDataset(val_ids, train=False)
+        val_loader = DataLoader(
+            val_ds, batch_size=1, shuffle=False, num_workers=0,
+            collate_fn=collate_fn, pin_memory=False,
+        )
 
     # ── Model ──
     print(f"Loading TransUNet from {args.weights}")
@@ -590,6 +600,8 @@ def main():
     print(f"  Freeze encoder: {args.freeze_encoder}")
     if args.unfreeze:
         print(f"  Selective unfreeze: {args.unfreeze}")
+    if args.train_all:
+        print(f"  Train ALL: yes (no validation)")
     print(f"  Checkpoint dir: {ckpt_dir}")
 
     # ── Training loop ──
@@ -648,22 +660,23 @@ def main():
             torch_scheduler.step()
             torch_optimizer.zero_grad()
 
-        # Validation
+        # Validation (skip if --train-all)
         val_losses = []
-        with torch.no_grad():
-            for x_val, y_val in val_loader:
-                if use_torch_optim:
-                    x_t = torch.tensor(x_val, device='cuda')
-                    y_t = torch.tensor(y_val, device='cuda')
-                    with amp_ctx:
-                        y_pred = model(x_t, training=False)
-                        vl = float(loss_fn(y_t, y_pred).detach().cpu())
-                    del x_t, y_t, y_pred
-                else:
-                    vl = model.test_on_batch(x_val, y_val)
-                    if isinstance(vl, (list, tuple)):
-                        vl = vl[0]
-                val_losses.append(float(vl))
+        if val_loader is not None:
+            with torch.no_grad():
+                for x_val, y_val in val_loader:
+                    if use_torch_optim:
+                        x_t = torch.tensor(x_val, device='cuda')
+                        y_t = torch.tensor(y_val, device='cuda')
+                        with amp_ctx:
+                            y_pred = model(x_t, training=False)
+                            vl = float(loss_fn(y_t, y_pred).detach().cpu())
+                        del x_t, y_t, y_pred
+                    else:
+                        vl = model.test_on_batch(x_val, y_val)
+                        if isinstance(vl, (list, tuple)):
+                            vl = vl[0]
+                    val_losses.append(float(vl))
 
         train_loss = np.mean(train_losses)
         val_loss = np.mean(val_losses) if val_losses else float('nan')
@@ -679,8 +692,8 @@ def main():
             model.save_weights(str(ckpt_path))
             print(f"  Checkpoint saved: {ckpt_path}")
 
-        # Save best
-        if val_loss < best_loss:
+        # Save best (skip when --train-all since there's no validation)
+        if val_loader is not None and val_loss < best_loss:
             best_loss = val_loss
             best_path = ckpt_dir / "transunet_best.weights.h5"
             model.save_weights(str(best_path))
