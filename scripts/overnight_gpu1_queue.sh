@@ -8,8 +8,8 @@ cd /workspace/vesuvius-kaggle-competition
 source /workspace/venv/bin/activate
 
 KEY="/root/.ssh/remote-gpu"
-GPU3="root@103.196.86.227"
-GPU3_PORT=13963
+GPU3="root@REDACTED"
+GPU3_PORT=REDACTED
 SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=10 -o ServerAliveInterval=30"
 
 DRY_RUN=false

@@ -22,11 +22,11 @@ for active decision-making — keep this file lean.
 | Name | GPU | SSH | Role |
 |---|---|---|---|
 | **gpu0** (this machine) | RTX 5090 32GB | local | Primary control. Probmap generation + PP sweep. |
-| **gpu1** (new) | RTX 6000 Ada 48GB | `ssh -i ~/.ssh/remote-gpu root@195.26.233.34 -p 39479` | ViT high-LR unfreeze (9/15 ep done, idle after restart). |
-| **gpu2** | RTX 6000 Ada 48GB | `ssh -i ~/.ssh/remote-gpu root@195.26.233.87 -p 25763` | Round-2 pseudo-labeling pipeline. Restarted Feb 23. |
-| **gpu3** (new) | RTX 6000 Ada 48GB | `ssh -i ~/.ssh/remote-gpu root@195.26.233.74 -p 32327` | ViT balanced done (7/7 ep). IDLE. |
-| **gpu4** (new) | RTX 6000 Ada 48GB | `ssh -i ~/.ssh/remote-gpu root@195.26.233.43 -p 53200` | Decoder balanced exp 2. Restarted Feb 23. |
-| **data-gpu** (new) | ? | `ssh -i ~/.ssh/remote-gpu root@195.26.233.98 -p 31182` | External data download + pseudo-labeling. |
+| **gpu1** (new) | RTX 6000 Ada 48GB | *(redacted)* | ViT high-LR unfreeze (9/15 ep done, idle after restart). |
+| **gpu2** | RTX 6000 Ada 48GB | *(redacted)* | Round-2 pseudo-labeling pipeline. Restarted Feb 23. |
+| **gpu3** (new) | RTX 6000 Ada 48GB | *(redacted)* | ViT balanced done (7/7 ep). IDLE. |
+| **gpu4** (new) | RTX 6000 Ada 48GB | *(redacted)* | Decoder balanced exp 2. Restarted Feb 23. |
+| **data-gpu** (new) | ? | *(redacted)* | External data download + pseudo-labeling. |
 
 - Old gpu1 (RTX 5090): **decommissioned** Feb 22. All data synced to gpu0.
 - Venv: `/workspace/venv/`, bootstrap: `bash /workspace/start.sh`

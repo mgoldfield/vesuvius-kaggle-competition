@@ -2,8 +2,8 @@
 # Monitor all 3 GPUs every 5 minutes
 # Usage: bash scripts/monitor_gpus.sh
 
-GPU1_SSH="ssh -i ~/.ssh/remote-gpu -o ConnectTimeout=5 -o StrictHostKeyChecking=no root@74.2.96.43 -p 10816"
-GPU2_SSH="ssh -i ~/.ssh/remote-gpu -o ConnectTimeout=5 -o StrictHostKeyChecking=no root@82.221.170.234 -p 31488"
+GPU1_SSH="ssh -i ~/.ssh/remote-gpu -o ConnectTimeout=5 -o StrictHostKeyChecking=no root@REDACTED -p REDACTED"
+GPU2_SSH="ssh -i ~/.ssh/remote-gpu -o ConnectTimeout=5 -o StrictHostKeyChecking=no root@REDACTED -p REDACTED"
 
 while true; do
     echo ""
@@ -31,7 +31,7 @@ while true; do
 
     # GPU1 (remote)
     echo ""
-    echo "--- gpu1 (remote 5090 @ 74.2.96.43:10816) ---"
+    echo "--- gpu1 (remote 5090) ---"
     $GPU1_SSH "
         PROC=\$(ps aux | grep -E 'train_transunet|eval_transunet|rsync|scp' | grep -v grep | head -3)
         if [ -n \"\$PROC\" ]; then
@@ -53,7 +53,7 @@ while true; do
 
     # GPU2 (remote)
     echo ""
-    echo "--- gpu2 (remote 5090 @ 82.221.170.234:31488) ---"
+    echo "--- gpu2 (remote 5090) ---"
     $GPU2_SSH "
         PROC=\$(ps aux | grep -E 'train_transunet|eval_transunet|rsync|scp' | grep -v grep | head -3)
         if [ -n \"\$PROC\" ]; then

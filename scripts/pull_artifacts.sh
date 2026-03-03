@@ -8,10 +8,10 @@ set -e
 cd /workspace/vesuvius-kaggle-competition
 
 KEY="/root/.ssh/remote-gpu"
-GPU2="root@103.196.86.229"
-GPU2_PORT=13849
-GPU3="root@103.196.86.227"
-GPU3_PORT=13963
+GPU2="root@REDACTED"
+GPU2_PORT=REDACTED
+GPU3="root@REDACTED"
+GPU3_PORT=REDACTED
 
 SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=10"
 BASE="/workspace/vesuvius-kaggle-competition"

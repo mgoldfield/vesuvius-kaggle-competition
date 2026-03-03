@@ -7,14 +7,14 @@ set -e
 cd /workspace/vesuvius-kaggle-competition
 
 KEY="/root/.ssh/remote-gpu"
-GPU3="root@103.196.86.227"
-GPU3_PORT=13963
+GPU3="root@REDACTED"
+GPU3_PORT=REDACTED
 SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=10 -o ServerAliveInterval=30"
 
 echo "=== Waiting for probmap transfer to GPU 3 ==="
 
 # Wait for rsync to finish (check if rsync process is still running)
-while pgrep -f "rsync.*103.196.86.227.*probmaps" > /dev/null 2>&1; do
+while pgrep -f "rsync.*gpu3.*probmaps" > /dev/null 2>&1; do
     TRANSFERRED=$(ssh $SSH_OPTS -i $KEY -p $GPU3_PORT $GPU3 \
         "ls /workspace/vesuvius-kaggle-competition/data/refinement_data/probmaps/*.npy 2>/dev/null | wc -l" 2>/dev/null || echo "?")
     echo "[$(date)] Transfer in progress: $TRANSFERRED/786 probmaps"
