@@ -96,7 +96,7 @@ The 70/30 ratio was consistently the sweet spot. The result was stable across di
 
 ### GPU fleet and overnight pipelines
 
-By this point I was running experiments on six GPUs: my local RTX 5090 for evaluation, four rented RTX 6000 Ada 48GB machines for training, and one for external data processing. I worked with [claude.ai](https://claude.ai) throughout the competition for writing training scripts, managing remote infrastructure, and debugging. The GPU fleet management is where Claude was most useful — writing bash chains that ran training → evaluation → checkpoint syncing, managing tmux sessions across machines, and running as background agents to monitor GPUs overnight.
+By this point I was running experiments on six GPUs: my local RTX 5090 for evaluation, four rented RTX 6000 Ada 48GB machines for training, and one for external data processing. I worked with claude.ai throughout the competition for writing training scripts, managing remote infrastructure, and debugging. The GPU fleet management is where Claude was most useful — writing bash chains that ran training → evaluation → checkpoint syncing, managing tmux sessions across machines, and running as background agents to monitor GPUs overnight.
 
 Every overnight pipeline had a `--dry-run` flag that tested every component on a single volume before committing to a full run. This policy came from experience: a 6-hour training run that fails 10 minutes in because of a missing import is a waste of a night.
 
@@ -140,6 +140,3 @@ Final placement: **885th out of 1,427 teams.** Top score: 0.607.
 
 I entered this competition to bridge the gap between theory and practice. I now understand sliding window inference, test-time augmentation, hysteresis thresholding, SWA blending, pseudo-labeling, and multi-GPU training management as tools I've used and debugged, not just concepts I've read about. The result wasn't competitive, but the experience was exactly what I was looking for.
 
----
-
-*Built over three weeks in February 2026. I worked with [claude.ai](https://claude.ai) throughout — for writing training scripts, managing remote GPU infrastructure, debugging, and strategic planning. Full project code and experiment logs are in this repository.*
