@@ -43,7 +43,7 @@ My "0.57 local score" was actually ~0.41 at the resolution Kaggle uses. After th
 
 ## Phase 2: The TransUNet Pivot (Feb 16–19)
 
-Around February 16th I systematically studied what the top competitors were doing. I downloaded and analyzed 17 public notebooks from the leaderboard.
+Around February 16th I systematically studied what the top competitors were doing. I downloaded and analyzed several public notebooks from the leaderboard.
 
 Every top-scoring entry used the same architecture: **TransUNet with an SEResNeXt50 encoder**, implemented in a library called `medicai` running on Keras 3 with a JAX backend. The model has a convolutional encoder pretrained on ImageNet, a Vision Transformer bottleneck for global context, and a U-Net-style decoder. Around 55 million parameters. The top public notebook scored 0.552 with this architecture.
 
@@ -136,7 +136,4 @@ The most ambitious pipeline downloaded scroll data from scrollprize.org, generat
 
 Final placement: **885th out of 1,427 teams.** Top score: 0.607.
 
-## Final Thoughts
-
-I entered this competition to bridge the gap between theory and practice. I now understand sliding window inference, test-time augmentation, hysteresis thresholding, SWA blending, pseudo-labeling, and multi-GPU training management as tools I've used and debugged, not just concepts I've read about. The result wasn't competitive, but the experience was exactly what I was looking for.
 
