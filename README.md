@@ -135,16 +135,6 @@ The most ambitious pipeline downloaded scroll data from scrollprize.org, generat
 
 **Refinement model.** A second model trained to clean up the first model's predictions. It improved topology and surface distance but destroyed variation of information. Per-voxel refinement fragments connected components.
 
-## What I Learned
-
-**The gap between coursework and competition is large.** fast.ai gave me the conceptual foundation and framework. But in a course, the data pipeline works and you focus on the model. In a competition, most of the work is everything around the model — evaluation infrastructure, normalization consistency, inference pipelines, post-processing.
-
-**Inference matters as much as training.** Gaussian sliding window inference and logit-space TTA averaging gave me a 62% score improvement without retraining. Full-pipeline evaluation is the only thing that correlates with the leaderboard.
-
-**Training-time metrics can be misleading.** Validation loss went down. Dice went down. The model was "learning." But the competition score got worse because training and evaluation used different normalizations. Verifying that training and inference pipelines match exactly is essential.
-
-**SWA blending works when fine-tuning doesn't.** When fine-tuning improves one metric component but degrades another, blending pretrained and fine-tuned weights in parameter space can capture both. The 70/30 ratio was robust across all my experiments.
-
 ## Score Progression
 
 | Milestone | Public Score | What changed |
