@@ -11,7 +11,7 @@ In 79 AD, Mount Vesuvius buried the city of Herculaneum under volcanic ash, carb
 
 ## Phase 1: Building from Scratch (Feb 5–16)
 
-I started the way fast.ai teaches: build a simple model, get a training loop working, iterate. My first model was a vanilla 3D U-Net (22.6M parameters, BatchNorm, mixed precision). I used `lr_find` to pick a learning rate, one-cycle scheduling, and a 50/50 mix of binary cross-entropy and Dice loss. It scored **0.331** on the public leaderboard.
+My first model was a vanilla 3D U-Net (22.6M parameters, BatchNorm, mixed precision). I used `lr_find` to pick a learning rate, one-cycle scheduling, and a 50/50 mix of binary cross-entropy and Dice loss. It scored **0.331** on the public leaderboard.
 
 Over the next nine runs, I worked through a series of changes:
 
@@ -49,9 +49,7 @@ My "0.57 local score" was actually ~0.41 at the resolution Kaggle uses. After th
 
 ## Phase 2: The TransUNet Pivot (Feb 16–19)
 
-Around February 16th I systematically studied what the top competitors were doing. I downloaded and analyzed several public notebooks from the leaderboard.
-
-Every top-scoring entry used the same architecture: **TransUNet with an SEResNeXt50 encoder**, implemented in a library called `medicai` running on Keras 3 with a JAX backend. The model has a convolutional encoder pretrained on ImageNet, a Vision Transformer bottleneck for global context, and a U-Net-style decoder. Around 55 million parameters. The top public notebook scored 0.552 with this architecture.
+After looking through published notebooks, I realized high scoring public notebooks all used the same architecture: **TransUNet with an SEResNeXt50 encoder**, implemented in a library called `medicai` running on Keras 3 with a JAX backend. The model has a convolutional encoder pretrained on ImageNet, a Vision Transformer bottleneck for global context, and a U-Net-style decoder. Around 55 million parameters. The top public notebook scored 0.552 with this architecture.
 
 I switched. I installed Keras 3 with `medicai`, downloaded the pretrained TransUNet weights from Kaggle, and rebuilt my inference pipeline. The pretrained model — without any fine-tuning — scored **0.504 on the public leaderboard** using a dual-stream inference approach adapted from the top notebook. Switching to community-trained weights on the dominant architecture was worth more than all the training experiments I'd run in the previous ten days.
 
