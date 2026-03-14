@@ -6,8 +6,8 @@ I entered [the Vesuvius Surface Detection competition](https://www.kaggle.com/co
 
 In 79 AD, Mount Vesuvius buried the city of Herculaneum under volcanic ash, carbonizing an entire library of papyrus scrolls. Researchers are now using CT scanning to peer inside these scrolls without unrolling them. The competition task: given 3D CT volumes (320×320×320 voxels), detect the surfaces of papyrus sheets within each scan. The surfaces are thin, curved, sometimes stacked in layers, and they occupy only 2–8% of each volume. The competition metric is a weighted combination of three scores: topological accuracy (do you find the right number of surfaces?), surface distance (are your surfaces in the right place?), and variation of information (do your connected components match the ground truth?). It's a 3D semantic segmentation problem, but with a scoring function that rewards structural correctness, not just per-voxel accuracy.
 
-![Slice gallery showing CT scans with model predictions and ground truth overlays across multiple z-depths of a scroll volume](plots/transunet_exploration/slice_gallery_26002_a.png)
-*A gallery of slices through one CT volume. Columns show: raw CT, probability map, thresholded prediction, and ground truth overlay. The papyrus surfaces appear as thin bright curves in the CT, but segmenting them precisely — especially where sheets are stacked close together — is the core challenge.*
+![A single CT slice showing layered papyrus surfaces (top-left) and the corresponding ground truth annotation with colored surface labels (bottom-left)](plots/transunet_exploration/crosssection_26002_a_center_z160.png)
+*A single slice through a CT volume. Top-left: the raw CT scan, where papyrus surfaces appear as bright curved lines. Bottom-left: ground truth annotation with each surface colored differently. The task is to go from one to the other — detecting thin, curved, closely-stacked surfaces in 3D.*
 
 ## Phase 1: Building from Scratch (Feb 5–16)
 
