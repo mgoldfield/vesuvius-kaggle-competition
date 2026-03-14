@@ -26,7 +26,7 @@ The `lr_find` utility from fast.ai consistently picked learning rates ~100x too 
 
 By Run 9, I had a SegResNet scoring **0.570 on local validation** and **0.398 on the public leaderboard**.
 
-### Key discovery: inference pipeline matters more than training
+### Inference pipeline matters more than training
 
 While building a proper evaluation script, I changed two things about inference: uniform sliding window weighting → **Gaussian weighting** (center of each patch weighted higher, since edges have less context), and probability-space TTA averaging → **logit-space averaging**.
 
@@ -35,7 +35,7 @@ Same model weights. No retraining. The mean competition score on five validation
 ![Probability distributions for foreground vs background voxels across six validation volumes, showing threshold sensitivity](plots/transunet_exploration/probability_histograms.png)
 *Foreground (green) vs background (purple) probability distributions across six volumes. The distributions overlap heavily in the 0.3–0.6 range — where you set the threshold matters enormously. Gaussian weighting and logit-space TTA sharpened these distributions, pushing more voxels toward 0 or 1 and making the threshold choice less fragile.*
 
-### Key discovery: metric downsample inflation
+### Metric downsample inflation
 
 I'd been computing the competition metric at 4x downsampled resolution (80³ instead of 320³) to save time. The topological scoring computes Betti numbers — counts of connected components, tunnels, and cavities — which is expensive at full resolution. Downsampling inflated scores by +0.16:
 
