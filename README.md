@@ -6,6 +6,9 @@ I entered [the Vesuvius Surface Detection competition](https://www.kaggle.com/co
 
 In 79 AD, Mount Vesuvius buried the city of Herculaneum under volcanic ash, carbonizing an entire library of papyrus scrolls. Researchers are now using CT scanning to peer inside these scrolls without unrolling them. The competition task: given 3D CT volumes (320×320×320 voxels), detect the surfaces of papyrus sheets within each scan. The surfaces are thin, curved, sometimes stacked in layers, and they occupy only 2–8% of each volume. The competition metric is a weighted combination of three scores: topological accuracy (do you find the right number of surfaces?), surface distance (are your surfaces in the right place?), and variation of information (do your connected components match the ground truth?). It's a 3D semantic segmentation problem, but with a scoring function that rewards structural correctness, not just per-voxel accuracy.
 
+![Slice gallery showing CT scans with model predictions and ground truth overlays across multiple z-depths of a scroll volume](plots/transunet_exploration/slice_gallery_26002_a.png)
+*A gallery of slices through one CT volume. Columns show: raw CT, probability map, thresholded prediction, and ground truth overlay. The papyrus surfaces appear as thin bright curves in the CT, but segmenting them precisely — especially where sheets are stacked close together — is the core challenge.*
+
 ## Phase 1: Building from Scratch (Feb 5–16)
 
 I started the way fast.ai teaches: build a simple model, get a training loop working, iterate. My first model was a vanilla 3D U-Net (22.6M parameters, BatchNorm, mixed precision). I used `lr_find` to pick a learning rate, one-cycle scheduling, and a 50/50 mix of binary cross-entropy and Dice loss. It scored **0.331** on the public leaderboard.
@@ -29,6 +32,9 @@ While building a proper evaluation script, I changed two things about inference:
 
 Same model weights. No retraining. The mean competition score on five validation volumes went from **0.307 to 0.498**. A 62% improvement from inference alone. This reframed how I thought about the problem — the gap between my training-loop metrics and actual performance was dominated by the inference pipeline, not the model.
 
+![Cross-section view showing CT image, probability heatmap, thresholded predictions under different post-processing, and error overlays color-coded by TP/FP/FN](plots/transunet_exploration/crosssection_26002_a_best_fg_z178.png)
+*A single slice showing the full inference pipeline: raw CT (top-left), probability heatmap, binary predictions under different thresholds, and error overlays (green=true positive, red=false positive, blue=false negative). The heatmap shows how confident the model is at each voxel — Gaussian weighting and logit-space TTA sharpened these probabilities dramatically.*
+
 ### Key discovery: metric downsample inflation
 
 I'd been computing the competition metric at 4x downsampled resolution (80³ instead of 320³) to save time. The topological scoring computes Betti numbers — counts of connected components, tunnels, and cavities — which is expensive at full resolution. Downsampling inflated scores by +0.16:
@@ -48,6 +54,9 @@ Around February 16th I systematically studied what the top competitors were doin
 Every top-scoring entry used the same architecture: **TransUNet with an SEResNeXt50 encoder**, implemented in a library called `medicai` running on Keras 3 with a JAX backend. The model has a convolutional encoder pretrained on ImageNet, a Vision Transformer bottleneck for global context, and a U-Net-style decoder. Around 55 million parameters. The top public notebook scored 0.552 with this architecture.
 
 I switched. I installed Keras 3 with `medicai`, downloaded the pretrained TransUNet weights from Kaggle, and rebuilt my inference pipeline. The pretrained model — without any fine-tuning — scored **0.504 on the public leaderboard** using a dual-stream inference approach adapted from the top notebook. Switching to community-trained weights on the dominant architecture was worth more than all the training experiments I'd run in the previous ten days.
+
+![Multi-axis visualization of TransUNet predictions showing axial, coronal, and sagittal views with CT, probability maps, predictions, and error overlays](plots/transunet_exploration/multiaxis_26002_a.png)
+*TransUNet predictions viewed from three axes. The axial view (top) shows clean surface detection, but the coronal and sagittal views reveal thick, blobby predictions — the model predicts surfaces 3–5x thicker than ground truth. This thickness problem drove most of the fine-tuning work in Phase 3.*
 
 ### The normalization bug
 
@@ -80,6 +89,9 @@ I also found that **freezing the encoder** (training only the decoder and predic
 
 None of the fine-tuned models beat pretrained on the composite score.
 
+![Side-by-side comparison of four models showing probability maps, predictions, error overlays, and metric bar charts for each](plots/multi_model_comparison/comparison_26002_a.png)
+*Visual comparison of pretrained vs. fine-tuned models on the same slice. Each row shows: probability heatmap, binary prediction, error overlay (green=TP, red=FP, blue=FN), and sub-metric scores. Fine-tuned models (rows 3–4) produce thinner predictions with better topology but more blue (missed surface) — the SDice tradeoff that SWA blending was designed to solve.*
+
 ### SWA blending
 
 The approach that finally worked was **Stochastic Weight Averaging (SWA)** — blending pretrained and fine-tuned weights in parameter space. 70% pretrained + 30% fine-tuned, applied to every parameter in the network. The pretrained model contributes spatial precision; the fine-tuned model contributes topological improvements; the blend gets both.
@@ -93,6 +105,9 @@ The approach that finally worked was **Stochastic Weight Averaging (SWA)** — b
 | **swa_70pre_30margin_dist_ep5** | **0.5551** | — | 0.8299 |
 
 The 70/30 ratio was consistently the sweet spot. The result was stable across different fine-tuned models — nearly every 70/30 blend landed in the 0.553–0.555 range regardless of which loss function produced the fine-tuned weights.
+
+![Prediction thickness maps comparing GT, pretrained, SWA blend, frozen_boundary, and dist_sq models](notebooks/analysis/figures/cell16_fig05.png)
+*Thickness maps across models. Ground truth (far left) has mean thickness ~6.5 voxels. The pretrained model averages ~13.7 (2.1x too thick). Fine-tuned models (frozen_boundary, dist_sq) thin slightly but remain ~11–13x. The SWA blend sits between pretrained and fine-tuned — it captures the thinning benefit without losing surface coverage.*
 
 ### GPU fleet and overnight pipelines
 
@@ -110,7 +125,13 @@ The most ambitious pipeline downloaded scroll data from scrollprize.org, generat
 
 **Ridge thinning.** The model's predictions were 3–5x too thick (15–30% foreground vs 2–8% in ground truth). Morphological ridge extraction in post-processing destroyed topology — topological accuracy went from 0.29 to 0.005. Thinning has to happen at training time.
 
+![SDice penalty breakdown showing excess surface vs missing surface percentages for three models](plots/multi_model_comparison/sdice_penalty_breakdown.png)
+*The fine-tuning dilemma visualized. The pretrained model has the most excess surface (34.2% FP boundary) but the least missing surface (17.5% FN). Fine-tuned models reduce excess thickness but miss more ground truth surface. No single model wins on both axes — this is why SWA blending was necessary.*
+
 **Connectivity-based post-processing.** Four methods, thirty configurations: probability-guided gap filling, dilate-merge-erode, two-pass hysteresis, and a combined approach. None beat simple hysteresis thresholding. The only post-processing parameter that mattered was `T_low` (the low hysteresis threshold), and its optimal value changed with every model.
+
+![Post-processing comparison showing four threshold configurations with predictions and error overlays](plots/transunet_exploration/pp_comparison_26002_a.png)
+*Four post-processing configurations on the same slice. Top row: binary predictions. Bottom row: error overlays. Despite very different threshold settings, the error patterns are nearly identical — post-processing moves voxels around at the margins but can't fix the fundamental thickness problem.*
 
 **Refinement model.** A second model trained to clean up the first model's predictions. It improved topology and surface distance but destroyed variation of information. Per-voxel refinement fragments connected components.
 
