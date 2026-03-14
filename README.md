@@ -1,6 +1,6 @@
 # My First Kaggle Competition: Three Weeks Detecting Ancient Papyrus Surfaces
 
-I entered [the Vesuvius Surface Detection competition](https://www.kaggle.com/competitions/vesuvius-challenge-surface-detection) on February 5th, 2026 — twenty-two days before the deadline of a four-month competition. I'd never done a Kaggle competition before. I'd taken both parts of the fast.ai course and read plenty of papers, but this was my first time applying any of it in practice. I finished 885th out of 1,427 teams with a private score of 0.506. This post covers what I tried, what I learned, and where I went wrong.
+I entered [the Vesuvius Surface Detection competition](https://www.kaggle.com/competitions/vesuvius-challenge-surface-detection) on February 5th, 2026 — twenty-two days before the deadline of a four-month competition. I'd never done a Kaggle competition before. I finished 885th out of 1,427 teams with a private score of 0.506. This post covers what I tried, what I learned, and where I went wrong.
 
 ## The Problem
 
