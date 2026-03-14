@@ -32,8 +32,8 @@ While building a proper evaluation script, I changed two things about inference:
 
 Same model weights. No retraining. The mean competition score on five validation volumes went from **0.307 to 0.498**. A 62% improvement from inference alone. This reframed how I thought about the problem — the gap between my training-loop metrics and actual performance was dominated by the inference pipeline, not the model.
 
-![Cross-section view showing CT image, probability heatmap, thresholded predictions under different post-processing, and error overlays color-coded by TP/FP/FN](plots/transunet_exploration/crosssection_26002_a_best_fg_z178.png)
-*A single slice showing the full inference pipeline: raw CT (top-left), probability heatmap, binary predictions under different thresholds, and error overlays (green=true positive, red=false positive, blue=false negative). The heatmap shows how confident the model is at each voxel — Gaussian weighting and logit-space TTA sharpened these probabilities dramatically.*
+![Probability distributions for foreground vs background voxels across six validation volumes, showing threshold sensitivity](plots/transunet_exploration/probability_histograms.png)
+*Foreground (green) vs background (purple) probability distributions across six volumes. The distributions overlap heavily in the 0.3–0.6 range — where you set the threshold matters enormously. Gaussian weighting and logit-space TTA sharpened these distributions, pushing more voxels toward 0 or 1 and making the threshold choice less fragile.*
 
 ### Key discovery: metric downsample inflation
 
